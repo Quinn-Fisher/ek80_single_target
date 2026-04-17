@@ -23,6 +23,12 @@ def _window_within_minus_6db(power_row: np.ndarray, peak_idx: int, peak_val: flo
     return np.arange(left, right + 1, dtype=int)
 
 
+def _range_at(range_m_arr: np.ndarray, ping_idx: int, peak_idx: int) -> float:
+    if np.ndim(range_m_arr) == 1:
+        return float(range_m_arr[peak_idx])
+    return float(range_m_arr[ping_idx, peak_idx])
+
+
 def detect_single_targets(
     data: Dict[str, Any],
     params: Dict[str, float],
@@ -44,7 +50,9 @@ def detect_single_targets(
     bs_i = beam["backscatter_i"].sel(channel=ch).values
     iq = bs_r + 1j * bs_i
 
-    power_linear = np.mean(np.abs(iq) ** 2, axis=-1)
+    # Use total received power (incoherent sector-power sum) for amplitude gating.
+    # Coherent summation of complex sectors can introduce phase-cancellation bias.
+    power_linear = np.sum(np.abs(iq) ** 2, axis=-1)
     power_db = 10.0 * np.log10(power_linear + 1e-20)
 
     ping_times = beam.ping_time.values
@@ -64,6 +72,10 @@ def detect_single_targets(
     min_npw = float(params["min_normalized_pulse_width"])
     max_npw = float(params["max_normalized_pulse_width"])
     phase_std_max = float(params["phase_std_max_deg"])
+    min_range_m = params.get("min_range_m")
+    max_range_m = params.get("max_range_m")
+    min_range_m = float(min_range_m) if min_range_m is not None else None
+    max_range_m = float(max_range_m) if max_range_m is not None else None
 
     n_pings = power_db.shape[0]
     detections: List[Dict[str, Any]] = []
@@ -72,6 +84,7 @@ def detect_single_targets(
     n_rejected_duration = 0
     n_rejected_phase = 0
     n_rejected_final_ts = 0
+    n_rejected_depth = 0
     n_phase_gate_skipped = 0
 
     angle_factor_along = float(data["beamwidth_alongship"]) / (2.0 * np.pi)
@@ -79,7 +92,7 @@ def detect_single_targets(
 
     for ping_idx in range(n_pings):
         row = power_db[ping_idx, :]
-        peaks, _ = find_peaks(row)
+        peaks, _ = find_peaks(row, height=th1, distance=2)
 
         candidates: List[Tuple[int, int]] = []
         for p in peaks:
@@ -95,6 +108,14 @@ def detect_single_targets(
         n_candidates_after_amplitude += len(candidates)
 
         for peak_idx, level in candidates:
+            range_val_m = _range_at(range_m_arr, ping_idx, peak_idx)
+            if min_range_m is not None and range_val_m < min_range_m:
+                n_rejected_depth += 1
+                continue
+            if max_range_m is not None and range_val_m > max_range_m:
+                n_rejected_depth += 1
+                continue
+
             peak_power_db = float(row[peak_idx])
             window_idx = _window_within_minus_6db(row, peak_idx, peak_power_db)
 
@@ -122,18 +143,20 @@ def detect_single_targets(
                     * np.conj((iq[ping_idx, window_idx, 0] + iq[ping_idx, window_idx, 1]) / 2.0)
                 )
 
-                std_along_deg = float(np.std(phase_along) * (180.0 / np.pi))
-                std_athwart_deg = float(np.std(phase_athwart) * (180.0 / np.pi))
+                # Convert electrical phase (rad) to mechanical angle (deg)
+                # before computing std/gating, so units match phase_std_max_deg.
+                phase_along_deg = phase_along * angle_factor_along
+                phase_athwart_deg = phase_athwart * angle_factor_athwart
+
+                std_along_deg = float(np.std(phase_along_deg))
+                std_athwart_deg = float(np.std(phase_athwart_deg))
 
                 if std_along_deg > phase_std_max or std_athwart_deg > phase_std_max:
                     n_rejected_phase += 1
                     continue
 
-                mean_phase_along = float(np.mean(phase_along))
-                mean_phase_athwart = float(np.mean(phase_athwart))
-                # Beamwidths are already in degrees, so factor yields deg/rad.
-                angle_along_deg = mean_phase_along * angle_factor_along
-                angle_athwart_deg = mean_phase_athwart * angle_factor_athwart
+                angle_along_deg = float(np.mean(phase_along_deg))
+                angle_athwart_deg = float(np.mean(phase_athwart_deg))
 
             compensation_db = compute_beam_compensation(
                 angle_along=angle_along_deg,
@@ -153,7 +176,7 @@ def detect_single_targets(
                     "ping_time": ping_times[ping_idx],
                     "ping_index": ping_idx,
                     "range_sample_index": peak_idx,
-                    "range_m": float(range_m_arr[peak_idx] if np.ndim(range_m_arr) == 1 else range_m_arr[ping_idx, peak_idx]),
+                    "range_m": range_val_m,
                     "angle_alongship_deg": angle_along_deg,
                     "angle_athwartship_deg": angle_athwart_deg,
                     "ts_uncompensated_db": peak_power_db,
@@ -179,6 +202,7 @@ def detect_single_targets(
         "n_rejected_duration": int(n_rejected_duration),
         "n_rejected_phase": int(n_rejected_phase),
         "n_rejected_final_ts": int(n_rejected_final_ts),
+        "n_rejected_depth": int(n_rejected_depth),
         "n_accepted": int(len(detections_df)),
         "n_phase_gate_skipped": int(n_phase_gate_skipped),
         "samples_per_pulse": float(pulse_dur / sample_spacing_s) if sample_spacing_s > 0 else np.nan,

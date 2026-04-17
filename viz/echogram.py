@@ -10,13 +10,27 @@ def plot_echogram(ds_Sv, detections_df, ch, title="Echogram"):
     sv_da = ds_Sv["Sv"].sel(channel=ch)
     sv_values = sv_da.values
     ping_time = sv_da["ping_time"].values
-    range_m = sv_da["echo_range"].values if "echo_range" in sv_da.coords else sv_da["range_sample"].values
+    y_title = "Range (m)"
+    if "echo_range" in ds_Sv.coords:
+        range_arr = ds_Sv["echo_range"].sel(channel=ch).values
+    elif "echo_range" in ds_Sv.variables:
+        range_arr = ds_Sv["echo_range"].sel(channel=ch).values
+    else:
+        range_arr = sv_da["range_sample"].values
+        y_title = "Range Sample Index"
+
+    # Plotly heatmap y-axis expects 1D. For per-ping echo_range, use the
+    # representative median profile across pings.
+    if np.ndim(range_arr) == 1:
+        range_y = range_arr
+    else:
+        range_y = np.nanmedian(range_arr, axis=0)
 
     fig = go.Figure()
     fig.add_trace(
         go.Heatmap(
             x=ping_time,
-            y=range_m,
+            y=range_y,
             z=sv_values.T,
             colorscale="Viridis",
             reversescale=True,
@@ -60,7 +74,7 @@ def plot_echogram(ds_Sv, detections_df, ch, title="Echogram"):
         height=600,
         title=f"{title} | Detections: {n_det}",
         xaxis={"title": "Ping Time", "tickformat": "%H:%M:%S"},
-        yaxis={"title": "Range (m)", "autorange": "reversed"},
+        yaxis={"title": y_title, "autorange": "reversed"},
         margin={"l": 60, "r": 30, "t": 50, "b": 50},
     )
     return fig
