@@ -136,148 +136,241 @@ Displays:
 
 ---
 
-## Exact Algorithm Implemented (Step-by-Step)
+## Exact Algorithm Implemented (Detailed Walkthrough)
 
-This section describes the current implementation in `detection/algorithm.py` exactly as coded.
+This section is written for non-programmers who want to verify the exact sequence of decisions the app makes in `detection/algorithm.py`.
 
-### 1) Load required data arrays
+### Big picture
 
-From the split-beam channel:
+For every ping, the app:
 
-- `backscatter_r`, `backscatter_i` from `Beam_group1`
-- Form complex IQ:
-  - `iq = backscatter_r + 1j * backscatter_i`
+1. finds local echo peaks (possible targets),
+2. removes peaks that do not look like a single-echo pulse in width,
+3. removes peaks whose phase is unstable (likely overlapping targets),
+4. applies beam compensation,
+5. keeps only peaks above final TS threshold.
 
-Auxiliary metadata:
+Every rejection stage is counted in Diagnostics so you can see where candidates are being filtered out.
 
-- pulse duration (`pulse_duration_s`)
-- sample spacing in seconds (`sample_spacing_s`) from loader
-- beamwidths alongship/athwartship (degrees)
-- ping times
-- physical range coordinate (`echo_range`) when available
+---
 
-### 2) Power proxy for amplitude screening
+### Step 1: Read channel data and build complex signal
 
-The app uses **incoherent total sector power**:
+The algorithm runs on one selected split-beam channel.
 
-- `power_linear = sum(|iq|^2 over beam sector dimension)`
-- `power_db = 10*log10(power_linear + 1e-20)`
+For that channel, EK80 provides:
 
-This avoids phase-cancellation artifacts that would occur with coherent sector summation.
+- real part: `backscatter_r`
+- imaginary part: `backscatter_i`
 
-### 3) Multi-threshold amplitude candidate screening
+These are combined into a complex signal per sample:
 
-Given:
+- `iq = backscatter_r + i * backscatter_i`
 
-- `ts_min = TSmin`
-- `mgc = max_gain_compensation_db`
+Think of this as each sample having:
 
-Thresholds:
+- **amplitude** (signal strength),
+- **phase** (direction-related information used by split-beam).
 
-- `th1 = ts_min - (2*mgc + 6)` (most permissive)
-- `th2 = ts_min - (2*mgc + 6)/2`
-- `th3 = ts_min` (strictest)
+The code also reads:
 
-Peak extraction per ping:
+- pulse duration (`pulse_duration_s`),
+- sample time spacing (`sample_spacing_s`),
+- beamwidth alongship/athwartship,
+- ping times,
+- range coordinate in meters (`echo_range`, when available).
 
-- `find_peaks(row, height=th1, distance=2)`
-  - `height=th1` removes sub-th1 local maxima
-  - `distance=2` reduces duplicate nearby picks
+---
 
-Tier assignment:
+### Step 2: Convert signal to power for candidate screening
 
-- if `v >= th3` => level `3`
-- elif `v >= th2` => level `2`
-- elif `v >= th1` => level `1`
+At each ping and range sample, the app computes a single power value from the split-beam sectors:
 
-The stored `threshold_level_passed` is the strictest tier passed.
+- sector power is `|iq|^2` per sector,
+- then it sums those sector powers (incoherent sum),
+- then converts to dB:
+  - `power_db = 10*log10(power_linear + tiny_number)`
 
-### 4) Optional depth gate (temporary diagnostic)
+Why this matters:
 
-If enabled:
+- This produces the amplitude trace used to find candidate peaks.
+- It does not yet decide if a peak is a single fish target.
 
-- reject candidate when `range_m < min_range_m`
-- reject candidate when `range_m > max_range_m`
+---
 
-Counter: `n_rejected_depth`
+### Step 3: Multi-threshold amplitude screening (Soule-style candidate pass)
 
-### 5) Duration gate from -6 dB window
+Using user parameters:
+
+- `TSmin` (`ts_min`)
+- max compensation (`mgc`)
+
+the algorithm computes 3 thresholds:
+
+- `th1 = ts_min - (2*mgc + 6)` -> most permissive (lowest)
+- `th2 = ts_min - (2*mgc + 6)/2` -> medium
+- `th3 = ts_min` -> strictest (highest)
+
+For each ping, local peaks are found with:
+
+- minimum peak height = `th1`,
+- minimum spacing between peaks = 2 samples.
+
+Each peak is assigned the strictest tier it passes:
+
+- pass `th3` -> tier 3
+- else pass `th2` -> tier 2
+- else pass `th1` -> tier 1
+
+Diagnostic effect:
+
+- all such peaks are counted in `Candidates found` (`n_candidates_after_amplitude`).
+
+---
+
+### Step 4: Optional temporary depth gate
+
+If the depth gate is enabled in the UI:
+
+- reject candidate if it is shallower than `Min analysis range`,
+- reject candidate if it is deeper than `Max analysis range`.
+
+Diagnostic effect:
+
+- `Rejected (depth)` (`n_rejected_depth`) increases.
+
+This gate is currently a diagnostic helper, not a full bottom-tracking model.
+
+---
+
+### Step 5: Duration gate using the -6 dB window
 
 For each remaining candidate:
 
-1. Find contiguous sample window around peak where power stays within `peak_db - 6 dB`.
-2. Compute:
-   - `n_samples_in_window`
-   - `actual_duration_s = n_samples_in_window * sample_spacing_s`
-   - `normalized_width = actual_duration_s / pulse_duration_s`
-3. Keep only if:
-   - `min_normalized_pulse_width <= normalized_width <= max_normalized_pulse_width`
+1. Identify the peak value (`peak_power_db`).
+2. Move left and right from the peak while samples stay above `peak - 6 dB`.
+3. This contiguous set is the candidate echo window.
 
-Counter: `n_rejected_duration`
+Then compute:
 
-### 6) Phase stability gate (Soule-style discriminator)
+- `n_samples_in_window`
+- `actual_duration_s = n_samples_in_window * sample_spacing_s`
+- `normalized_pulse_width = actual_duration_s / pulse_duration_s`
 
-If `n_samples_in_window < 3`:
+Pass rule:
 
-- bypass phase gate (accepted through this stage)
-- mark `phase_gate_skipped = True`
-- increment `n_phase_gate_skipped`
+- keep only if
+  - `min_normalized_pulse_width <= normalized_pulse_width <= max_normalized_pulse_width`
 
-Else compute electrical phase-difference series:
+Diagnostic effect:
 
-- `phase_along_rad = angle(iq0 * conj(iq1))`
-- `phase_athwart_rad = angle(iq2 * conj((iq0+iq1)/2))`
+- failures increase `Rejected (duration)`.
 
-Convert electrical phase to mechanical-angle units:
+Interpretation:
 
-- `angle_factor_along = beamwidth_alongship_deg / (2*pi)`
-- `angle_factor_athwart = beamwidth_athwartship_deg / (2*pi)`
-- `phase_along_deg = phase_along_rad * angle_factor_along`
-- `phase_athwart_deg = phase_athwart_rad * angle_factor_athwart`
+- too narrow: likely noise spike,
+- too wide: likely extended/overlapping/non-single return.
 
-Phase gate:
+---
 
-- `std_along_deg = std(phase_along_deg)`
-- `std_athwart_deg = std(phase_athwart_deg)`
-- reject if either std exceeds `phase_std_max_deg`
+### Step 6: Phase stability gate (core single-vs-overlap discriminator)
 
-Counter: `n_rejected_phase`
+If window has fewer than 3 samples:
 
-### 7) Mean angle per accepted candidate
+- phase gate is skipped (firmware-like behavior),
+- candidate is allowed to continue,
+- `phase_gate_skipped=True`.
 
-For phase-gated candidates (or skipped phase gate):
+If window has 3+ samples:
 
-- `angle_alongship_deg = mean(phase_along_deg)` (or `0.0` if phase skipped)
-- `angle_athwartship_deg = mean(phase_athwart_deg)` (or `0.0` if phase skipped)
+1. Compute electrical phase-difference series:
+   - alongship from sectors 0 and 1
+   - athwartship from sector 2 vs average of sectors 0 and 1
+2. Convert those phase series to mechanical-angle units using beamwidth factors.
+3. Compute standard deviation of each converted series.
+4. Reject candidate if either std exceeds `phase_std_max_deg`.
 
-### 8) Beam compensation
+Diagnostic effect:
 
-Implemented in `detection/compensation.py`:
+- failures increase `Rejected (phase)`,
+- skipped short-window cases increase `n_phase_gate_skipped`.
+
+Interpretation:
+
+- stable phase across samples -> more like single target,
+- unstable phase -> more like mixed/overlapping echoes.
+
+---
+
+### Step 7: Compute mean target angle
+
+For candidates that pass phase gate:
+
+- mean alongship angle = mean of converted alongship phase series,
+- mean athwartship angle = mean of converted athwartship phase series.
+
+These angles are used for beam compensation.
+
+---
+
+### Step 8: Beam compensation
+
+The app uses a Simrad-style two-way compensation:
 
 - `compensation_db = 6.0206 * ((angle_along/bw_along)^2 + (angle_athwart/bw_athwart)^2)`
-- cap at `max_gain_compensation_db`
+- capped at `Max gain comp`.
 
-### 9) Final TS gate
+Then:
 
-- `ts_compensated_db = peak_power_db + compensation_db`
-- keep candidate only if `ts_compensated_db >= ts_min`
+- `ts_compensated_db = ts_uncompensated_db + compensation_db`
 
-Counter: `n_rejected_final_ts`
+---
 
-### 10) Output assembly
+### Step 9: Final TS acceptance
 
-Accepted candidates become rows in the output DataFrame with all fields listed above.
+Final keep/reject rule:
 
-Diagnostics dictionary includes:
+- keep only if `ts_compensated_db >= TSmin`
 
-- `n_candidates_after_amplitude`
-- `n_rejected_duration`
-- `n_rejected_phase`
-- `n_rejected_final_ts`
-- `n_rejected_depth` (if depth gate used)
-- `n_accepted`
+Diagnostic effect:
+
+- failures increase `Rejected (final TS)`.
+
+---
+
+### Step 10: Save accepted detections
+
+Each accepted detection is written as one row with:
+
+- ping/time/range position,
+- alongship/athwartship angle,
+- uncompensated and compensated TS,
+- phase std values,
+- normalized pulse width,
+- compensation amount,
+- threshold tier passed,
+- whether phase gate was skipped.
+
+Diagnostics summarize how many candidates were removed at each stage:
+
+- `Candidates found`
+- `Rejected (depth)` (if enabled)
+- `Rejected (duration)`
+- `Rejected (phase)`
+- `Rejected (final TS)`
+- `Accepted targets`
 - `n_phase_gate_skipped`
-- `samples_per_pulse = pulse_duration_s / sample_spacing_s`
+- `samples_per_pulse`
+
+---
+
+### Candidate flow equation (quick check)
+
+You can verify counts with:
+
+`Accepted = Candidates - Rejected(depth) - Rejected(duration) - Rejected(phase) - Rejected(final TS)`
+
+Because filters run in that order, this should hold (allowing only for formatting/rounding display differences).
 
 ---
 
