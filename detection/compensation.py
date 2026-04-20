@@ -9,10 +9,14 @@ def compute_beam_compensation(
     max_gain_db: float,
 ) -> float:
     """
-    Compute two-way Simrad beam pattern compensation in dB.
+    Compute Simrad-style beam pattern compensation in dB.
 
-    Parameters are mechanical angles and beam widths in degrees.
+    Parameters are mechanical angles in degrees and EK80 two-way beam widths in degrees.
     """
-    compensation_db = 6.0206 * ((angle_along / bw_along) ** 2 + (angle_athwart / bw_athwart) ** 2)
+    # Soule/Simrad compensation uses one-way beamwidth in the denominator.
+    # EK80 metadata is commonly stored as two-way beamwidth, so convert here.
+    bw_along_oneway = float(bw_along) / 2.0
+    bw_athwart_oneway = float(bw_athwart) / 2.0
+    compensation_db = 6.0206 * ((angle_along / bw_along_oneway) ** 2 + (angle_athwart / bw_athwart_oneway) ** 2)
     return min(float(compensation_db), float(max_gain_db))
 

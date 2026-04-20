@@ -6,17 +6,17 @@ import numpy as np
 import plotly.graph_objects as go
 
 
-def plot_echogram(ds_Sv, detections_df, ch, title="Echogram"):
-    sv_da = ds_Sv["Sv"].sel(channel=ch)
-    sv_values = sv_da.values
-    ping_time = sv_da["ping_time"].values
+def plot_echogram(dataset, detections_df, ch, value_var="Sv", title="Echogram"):
+    da = dataset[value_var].sel(channel=ch)
+    values = da.values
+    ping_time = da["ping_time"].values
     y_title = "Range (m)"
-    if "echo_range" in ds_Sv.coords:
-        range_arr = ds_Sv["echo_range"].sel(channel=ch).values
-    elif "echo_range" in ds_Sv.variables:
-        range_arr = ds_Sv["echo_range"].sel(channel=ch).values
+    if "echo_range" in dataset.coords:
+        range_arr = dataset["echo_range"].sel(channel=ch).values
+    elif "echo_range" in dataset.variables:
+        range_arr = dataset["echo_range"].sel(channel=ch).values
     else:
-        range_arr = sv_da["range_sample"].values
+        range_arr = da["range_sample"].values
         y_title = "Range Sample Index"
 
     # Plotly heatmap y-axis expects 1D. For per-ping echo_range, use the
@@ -26,18 +26,25 @@ def plot_echogram(ds_Sv, detections_df, ch, title="Echogram"):
     else:
         range_y = np.nanmedian(range_arr, axis=0)
 
+    if value_var == "TS":
+        colorbar_title = "TS (dB re 1 m²)"
+        trace_name = "TS"
+    else:
+        colorbar_title = "Sv (dB re 1 m⁻¹)"
+        trace_name = "Sv"
+
     fig = go.Figure()
     fig.add_trace(
         go.Heatmap(
             x=ping_time,
             y=range_y,
-            z=sv_values.T,
+            z=values.T,
             colorscale="Viridis",
             reversescale=True,
             zmin=-80,
             zmax=-20,
-            colorbar={"title": "Sv (dB re 1 m⁻¹)"},
-            name="Sv",
+            colorbar={"title": colorbar_title},
+            name=trace_name,
         )
     )
 

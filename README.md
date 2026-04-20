@@ -1,13 +1,13 @@
 # EK80 Single Target Detection (Streamlit)
 
-This app performs hydroacoustic single-target detection from Kongsberg EK80 `.raw` data using a Soule et al. (1997)-style phase stability workflow for split-beam transducers.
+This app performs hydroacoustic split-beam single-target detection from EK80 `.raw` data using a Soule et al. (1997)-style workflow, with calibration behavior tuned for transparent EK80 validation.
 
-It is implemented as a Streamlit UI with:
-
-- EK80 file loading and Sv calibration via `echopype`
-- Candidate screening and phase/discrimination logic
-- Interactive Plotly echogram + TS histogram
-- Detection table export to CSV
+It provides:
+- EK80 loading via `echopype`
+- calibrated `Sv` and `TS` products
+- single-target detection with stage-by-stage diagnostics
+- side-by-side `Sv` and `TS` echograms with detection overlays
+- target table export and calibration verification script
 
 ---
 
@@ -17,25 +17,24 @@ It is implemented as a Streamlit UI with:
 single_target/
 ├── app.py
 ├── detection/
-│   ├── __init__.py
 │   ├── loader.py
 │   ├── algorithm.py
 │   └── compensation.py
 ├── viz/
-│   ├── __init__.py
 │   ├── echogram.py
 │   └── histogram.py
-└── requirements.txt
+├── verify_calibration.py
+└── README.md
 ```
 
 ---
 
 ## Requirements
 
-- Python 3.10+ recommended (3.11 typically easiest for dependency wheels)
-- EK80 `.raw` files with at least one split-beam channel (`beam_type == 17`)
+- Python 3.10+ (3.11/3.12 works with current dependencies)
+- EK80 `.raw` with at least one split-beam channel (`beam_type == 17`)
 
-Install deps:
+Install:
 
 ```bash
 pip install -r requirements.txt
@@ -45,391 +44,212 @@ pip install -r requirements.txt
 
 ## Run the App
 
-From the `single_target` directory:
+From `single_target/`:
 
 ```bash
 streamlit run app.py
 ```
 
-Then in the browser:
+Workflow:
+1. Upload EK80 `.raw`
+2. Select split-beam channel
+3. Set parameters
+4. Click **Run Detection**
+5. Review:
+   - **Echogram** tab (Sv panel + TS panel)
+   - **TS Distribution**
+   - **Detection Table**
 
-1. Upload an EK80 `.raw` file in the sidebar (this loads metadata/calibration and discovers channels).
-2. Select the split-beam channel to analyze.
-3. Set detection parameters.
-4. Click **Run Detection**.
-4. Review:
-   - **Echogram** tab
-   - **TS Distribution** tab
-   - **Detection Table** tab (with CSV export)
-
-Important behavior:
-
-- Upload loads file metadata and channel options only (not target detection).
-- Detection runs only when you click **Run Detection**.
-- Parameter/channel edits alone do not trigger detection.
+Notes:
+- Upload only loads data/metadata; detection runs only on button click.
+- Changing channel or parameters does not auto-run detection.
 
 ---
 
-## Sidebar Controls
+## Calibration and Gain Offset
 
-### Detection parameters
+Sidebar calibration input:
+- `TS Gain offset (dB) [CalTSGain - OrigTSGain]`
 
-- `TSmin (dB)`: minimum compensated target strength threshold
-- `Max gain comp (dB)`: cap for beam compensation
-- `Min pulse width`: minimum normalized pulse width
-- `Max pulse width`: maximum normalized pulse width
-- `Phase std max (deg)`: maximum allowed phase std (mechanical-angle units)
-
-### Temporary depth gate (diagnostic)
-
-- `Enable depth gate`
-- `Min analysis range (m)`
-- `Max analysis range (m)`
-
-This is a debugging/analysis filter to isolate depth bands.
-
----
-
-## Outputs
-
-### Diagnostics panel
-
-Displays:
-
-- `Candidates found`
-- `Rejected (duration)`
-- `Rejected (phase)`
-- `Rejected (final TS)`
-- `Rejected (depth)` (when depth gate is enabled)
-- `Accepted targets`
-- warning count for detections with `<3` samples in `-6 dB` window (phase gate bypassed)
-
-### File info panel
-
-Displays:
-
-- Channel
-- Frequency
-- Pulse duration
-- Samples per pulse
-- Sound speed
-- Ping count
-- Range sample count
-- Range extent (m)
-
-### Detection table columns
-
-- `ping_time`
-- `ping_index`
-- `range_sample_index`
-- `range_m`
-- `angle_alongship_deg`
-- `angle_athwartship_deg`
-- `ts_uncompensated_db`
-- `ts_compensated_db`
-- `phase_std_alongship_deg`
-- `phase_std_athwartship_deg`
-- `normalized_pulse_width`
-- `compensation_db`
-- `threshold_level_passed`
-- `phase_gate_skipped`
-
----
-
-## Exact Algorithm Implemented (Detailed Walkthrough)
-
-This section is written for non-programmers who want to verify the exact sequence of decisions the app makes in `detection/algorithm.py`.
-
-### Big picture
-
-For every ping, the app:
-
-1. finds local echo peaks (possible targets),
-2. removes peaks that do not look like a single-echo pulse in width,
-3. removes peaks whose phase is unstable (likely overlapping targets),
-4. applies beam compensation,
-5. keeps only peaks above final TS threshold.
-
-Every rejection stage is counted in Diagnostics so you can see where candidates are being filtered out.
-
----
-
-### Step 1: Read channel data and build complex signal
-
-The algorithm runs on one selected split-beam channel.
-
-For that channel, EK80 provides:
-
-- real part: `backscatter_r`
-- imaginary part: `backscatter_i`
-
-These are combined into a complex signal per sample:
-
-- `iq = backscatter_r + i * backscatter_i`
-
-Think of this as each sample having:
-
-- **amplitude** (signal strength),
-- **phase** (direction-related information used by split-beam).
-
-The code also reads:
-
-- pulse duration (`pulse_duration_s`),
-- sample time spacing (`sample_spacing_s`),
-- beamwidth alongship/athwartship,
-- ping times,
-- range coordinate in meters (`echo_range`, when available).
-
----
-
-### Step 2: Convert signal to power for candidate screening
-
-At each ping and range sample, the app computes a single power value from the split-beam sectors:
-
-- sector power is `|iq|^2` per sector,
-- then it sums those sector powers (incoherent sum),
-- then converts to dB:
-  - `power_db = 10*log10(power_linear + tiny_number)`
-
-Why this matters:
-
-- This produces the amplitude trace used to find candidate peaks.
-- It does not yet decide if a peak is a single fish target.
-
----
-
-### Step 3: Multi-threshold amplitude screening (Soule-style candidate pass)
-
-Using user parameters:
-
-- `TSmin` (`ts_min`)
-- max compensation (`mgc`)
-
-the algorithm computes 3 thresholds:
-
-- `th1 = ts_min - (2*mgc + 6)` -> most permissive (lowest)
-- `th2 = ts_min - (2*mgc + 6)/2` -> medium
-- `th3 = ts_min` -> strictest (highest)
-
-For each ping, local peaks are found with:
-
-- minimum peak height = `th1`,
-- minimum spacing between peaks = 2 samples.
-
-Each peak is assigned the strictest tier it passes:
-
-- pass `th3` -> tier 3
-- else pass `th2` -> tier 2
-- else pass `th1` -> tier 1
-
-Diagnostic effect:
-
-- all such peaks are counted in `Candidates found` (`n_candidates_after_amplitude`).
-
----
-
-### Step 4: Optional temporary depth gate
-
-If the depth gate is enabled in the UI:
-
-- reject candidate if it is shallower than `Min analysis range`,
-- reject candidate if it is deeper than `Max analysis range`.
-
-Diagnostic effect:
-
-- `Rejected (depth)` (`n_rejected_depth`) increases.
-
-This gate is currently a diagnostic helper, not a full bottom-tracking model.
-
----
-
-### Step 5: Duration gate using the -6 dB window
-
-For each remaining candidate:
-
-1. Identify the peak value (`peak_power_db`).
-2. Move left and right from the peak while samples stay above `peak - 6 dB`.
-3. This contiguous set is the candidate echo window.
-
-Then compute:
-
-- `n_samples_in_window`
-- `actual_duration_s = n_samples_in_window * sample_spacing_s`
-- `normalized_pulse_width = actual_duration_s / pulse_duration_s`
-
-Pass rule:
-
-- keep only if
-  - `min_normalized_pulse_width <= normalized_pulse_width <= max_normalized_pulse_width`
-
-Diagnostic effect:
-
-- failures increase `Rejected (duration)`.
+App behavior:
+- `effective_gain_db = gain_db_from_file + gain_offset_db`
+- `TS_adjusted = TS_from_echopype - 2 * gain_offset_db`
 
 Interpretation:
+- positive offset -> TS decreases by `2 * offset`
+- negative offset -> TS increases by `2 * abs(offset)`
+- `0.0` -> use file gain as-is
 
-- too narrow: likely noise spike,
-- too wide: likely extended/overlapping/non-single return.
-
----
-
-### Step 6: Phase stability gate (core single-vs-overlap discriminator)
-
-If window has fewer than 3 samples:
-
-- phase gate is skipped (firmware-like behavior),
-- candidate is allowed to continue,
-- `phase_gate_skipped=True`.
-
-If window has 3+ samples:
-
-1. Compute electrical phase-difference series:
-   - alongship from sectors 0 and 1
-   - athwartship from sector 2 vs average of sectors 0 and 1
-2. Convert those phase series to mechanical-angle units using beamwidth factors.
-3. Compute standard deviation of each converted series.
-4. Reject candidate if either std exceeds `phase_std_max_deg`.
-
-Diagnostic effect:
-
-- failures increase `Rejected (phase)`,
-- skipped short-window cases increase `n_phase_gate_skipped`.
-
-Interpretation:
-
-- stable phase across samples -> more like single target,
-- unstable phase -> more like mixed/overlapping echoes.
+This follows TS equation gain sign (`-2*G`).
 
 ---
 
-### Step 7: Compute mean target angle
+## Detection Parameters
 
-For candidates that pass phase gate:
-
-- mean alongship angle = mean of converted alongship phase series,
-- mean athwartship angle = mean of converted athwartship phase series.
-
-These angles are used for beam compensation.
-
----
-
-### Step 8: Beam compensation
-
-The app uses a Simrad-style two-way compensation:
-
-- `compensation_db = 6.0206 * ((angle_along/bw_along)^2 + (angle_athwart/bw_athwart)^2)`
-- capped at `Max gain comp`.
-
-Then:
-
-- `ts_compensated_db = ts_uncompensated_db + compensation_db`
+- `TSmin (dB)`: final compensated TS threshold
+- `Max gain comp (dB)`: cap on beam compensation
+- `Min pulse width`: lower bound on normalized pulse width
+- `Max pulse width`: upper bound on normalized pulse width
+- `Phase std max (deg)`: gate on phase-derived mechanical angle std (default `0.237`)
+- Optional temporary depth gate:
+  - `Min analysis range (m)`
+  - `Max analysis range (m)`
 
 ---
 
-### Step 9: Final TS acceptance
+## Exact Detection Pipeline
 
-Final keep/reject rule:
+Implemented in `detection/algorithm.py`.
 
-- keep only if `ts_compensated_db >= TSmin`
+1. **Build IQ**
+   - `iq = backscatter_r + 1j * backscatter_i`
 
-Diagnostic effect:
+2. **Uncompensated TS source**
+   - Uses `ds_TS["TS"]` from `ep.calibrate.compute_TS(..., waveform_mode="CW", encode_mode="complex")`
+   - Applies user gain offset in TS space (`-2 * gain_offset_db`)
 
-- failures increase `Rejected (final TS)`.
+3. **Amplitude candidate thresholds**
+   - `th1 = ts_min - (2*mgc + 6)`
+   - `th2 = ts_min - ((2*mgc + 6)/2)`
+   - `th3 = ts_min`
+   - Peaks from `find_peaks(row, height=th1, distance=2)`
 
----
+4. **Optional depth gate**
+   - reject outside `[min_range_m, max_range_m]`
 
-### Step 10: Save accepted detections
+5. **Pulse-width gate**
+   - contiguous `-6 dB` window around peak
+   - `normalized_width = (n_samples * sample_spacing_s) / pulse_duration_s`
+   - keep only within `[min_npw, max_npw]`
 
-Each accepted detection is written as one row with:
+6. **Phase stability gate**
+   - if fewer than 3 samples in window: skip phase gate for that candidate
+   - alongship phase: sector 0 vs 1
+   - athwartship phase: sector 2 vs average(0,1)
+   - convert electrical phase to mechanical angle with EK80 metadata:
+     - `angle = (phase_rad * 180/pi) / angle_sensitivity + angle_offset`
+   - reject if std of either axis exceeds `phase_std_max_deg`
 
-- ping/time/range position,
-- alongship/athwartship angle,
-- uncompensated and compensated TS,
-- phase std values,
-- normalized pulse width,
-- compensation amount,
-- threshold tier passed,
-- whether phase gate was skipped.
+7. **Beam compensation**
+   - `comp = 6.0206 * ((along/(bw_along/2))^2 + (athwart/(bw_athwart/2))^2)`
+   - `bw_*` are EK80 two-way metadata and converted to one-way in denominator
+   - capped at `max_gain_compensation_db`
 
-Diagnostics summarize how many candidates were removed at each stage:
+8. **Final TS gate**
+   - `ts_compensated = ts_uncompensated + comp`
+   - keep if `ts_compensated >= ts_min`
 
-- `Candidates found`
-- `Rejected (depth)` (if enabled)
-- `Rejected (duration)`
-- `Rejected (phase)`
-- `Rejected (final TS)`
-- `Accepted targets`
-- `n_phase_gate_skipped`
-- `samples_per_pulse`
+9. **Outputs**
+   - detection table with range, angles, TS, compensation, pulse width, phase std, tier, skip flag
+   - diagnostics counters at each rejection stage
 
----
-
-### Candidate flow equation (quick check)
-
-You can verify counts with:
-
+Candidate accounting:
 `Accepted = Candidates - Rejected(depth) - Rejected(duration) - Rejected(phase) - Rejected(final TS)`
 
-Because filters run in that order, this should hold (allowing only for formatting/rounding display differences).
-
 ---
 
-## Loader Details (`detection/loader.py`)
+## Loader Behavior (`detection/loader.py`)
 
-`load_raw_file(filepath)` does:
-
+`load_raw_file(filepath)`:
 1. `ep.open_raw(..., sonar_model="EK80")`
 2. `ep.calibrate.compute_Sv(..., waveform_mode="CW", encode_mode="complex")`
-3. Finds split-beam channel (`beam_type == 17`) or raises error
-4. Extracts:
+3. `ep.calibrate.compute_TS(..., waveform_mode="CW", encode_mode="complex")`
+4. picks split-beam channel(s)
+5. extracts channel metadata:
    - pulse duration
-   - sound speed (searched in Beam, Environment, then Sv dataset)
-   - beamwidths
-   - list of split-beam channels (`ch_splitbeam_all`)
-5. Computes `sample_spacing_s` from **physical range spacing** (`echo_range` preferred), not index spacing
+   - sound speed (Beam -> Environment -> Sv fallback)
+   - two-way beamwidths
+   - angle sensitivities and offsets
+   - gain correction
+   - frequency
+   - impedances (with defaults when missing)
+6. computes sample spacing from physical range spacing (`echo_range` preferred)
 
-`build_channel_data(base_data, ch)` then prepares channel-specific metadata
-for whichever split-beam channel the user selected in the UI.
+`build_channel_data(base_data, ch)` applies this for selected channel.
 
 ---
 
-## Visualization Details
+## Visualization
 
 ### Echogram (`viz/echogram.py`)
 
-- Plotly `Heatmap` of Sv
-- detection overlay as white markers with black outline
-- dark theme
-- y-axis uses physical `echo_range` when available (including 2D handling)
+Echogram tab now shows both:
+- **top panel:** `Sv` heatmap (`ds_Sv["Sv"]`)
+- **bottom panel:** `TS` heatmap (`ds_TS["TS"]`)
+
+Both support:
+- overlay of accepted detections
+- physical range axis from `echo_range` (1D or median profile for 2D range grids)
 
 ### Histogram (`viz/histogram.py`)
 
-- Plotly histogram of `ts_compensated_db`
+- histogram of `ts_compensated_db`
 - 1 dB bins
-- TSmin dashed reference line
+- TSmin reference line
+
+---
+
+## Calibration Verification Script
+
+Use `verify_calibration.py` to compare app output with EK80 calibration XML `<TargetHits>`.
+
+Example:
+
+```bash
+python verify_calibration.py \
+  --raw /path/to/calibration.raw \
+  --xml /path/to/CalibrationDataFile.xml
+```
+
+The script prints:
+- XML baseline stats (`TsComp`, `TsUncomp`, compensation term, range, hit count)
+- app output stats for current settings
+- mismatch deltas
+- pass/fail against configurable tolerances
+- suggested gain offset (`CalTSGain - OrigTSGain`)
+- dominant rejection stage from diagnostics
+
+Defaults are intentionally calibration-oriented. Adjust args as needed for survey/fish runs.
+
+---
+
+## Changes vs Public Repo
+
+Relative to public `main` at [Quinn-Fisher/ek80_single_target](https://github.com/Quinn-Fisher/ek80_single_target):
+
+- uncompensated TS now sourced from `echopype.compute_TS` rather than ad hoc power-only scaling
+- explicit gain-offset semantics applied in TS domain (`-2*offset`)
+- phase-angle conversion now uses EK80 angle sensitivity/offset metadata
+- beam compensation uses one-way beamwidth denominator derived from EK80 two-way fields
+- Echogram tab now shows both `Sv` and `TS` panels
+- added/expanded `verify_calibration.py` for XML-vs-app reproducible calibration checks
 
 ---
 
 ## Troubleshooting
 
 - **No split-beam channel found**
-  - File may not contain split-beam data; algorithm requires split-beam transducer channel.
+  - File lacks split-beam data.
+
+- **No detections**
+  - Check diagnostics to identify dominant rejection stage.
 
 - **All rejected by depth**
-  - Depth gate likely outside actual file range. Check `Range extent` in sidebar.
+  - Depth gate outside data range.
 
 - **All rejected by duration**
-  - Relax pulse width bounds (especially for short pulses / low samples-per-pulse).
+  - Relax pulse-width bounds.
 
 - **All rejected by phase**
-  - Increase `Phase std max (deg)` gradually (e.g., `0.237` -> `0.5` -> `1.0` -> `2.0`).
+  - Increase `Phase std max (deg)` carefully from default as needed.
 
 - **All rejected by final TS**
-  - Lower `TSmin` or inspect whether echoes in selected depth band are weak.
+  - Lower `TSmin` or inspect whether detected echoes are weak for selected window.
 
 ---
 
 ## Notes
 
-- This implementation is intended as a transparent, inspectable workflow for analysis and iteration.
-- The temporary depth gate is diagnostic and may be replaced later with per-ping bottom-aware exclusion.
+- This implementation is designed to be inspectable and calibration-auditable.
+- Depth gate remains a diagnostic tool, not bottom-track logic.
+- For inter-software parity, compare distributions and diagnostics, not only hit counts.

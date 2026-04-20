@@ -76,6 +76,73 @@ def _compute_sample_spacing_s(beam: Any, ds_Sv: Any, ch: str, sound_speed: float
     return 2.0 * sample_spacing_m / sound_speed
 
 
+def _extract_gain_db(ds_Sv: Any, ch: str) -> float:
+    """
+    Extract gain correction (dB) from calibrated Sv metadata.
+
+    This is the file-provided baseline gain used by the TS conversion.
+    """
+    if "gain_correction" not in ds_Sv.variables:
+        raise ValueError("Could not find `gain_correction` in calibrated Sv dataset.")
+    da = ds_Sv["gain_correction"]
+    if "channel" in da.dims:
+        da = da.sel(channel=ch)
+    return _first_value(da)
+
+
+def _extract_frequency_hz(beam: Any, ch: str) -> float:
+    """Extract nominal channel frequency in Hz."""
+    if "frequency_nominal" not in beam.variables:
+        raise ValueError("Could not find `frequency_nominal` in beam dataset.")
+    return _first_value(beam["frequency_nominal"].sel(channel=ch))
+
+
+def _extract_impedance_transceiver_ohm(ed: Any, beam: Any, ch: str) -> float:
+    """
+    Extract transceiver impedance (ohm), preferring beam metadata then Vendor_specific.
+    """
+    if "impedance_transceiver" in beam.variables:
+        da = beam["impedance_transceiver"]
+        if "channel" in da.dims:
+            da = da.sel(channel=ch)
+        return _first_value(da)
+
+    if "Vendor_specific" in ed.group_paths:
+        vendor = ed["Vendor_specific"]
+        if "impedance_transceiver" in vendor.variables:
+            da = vendor["impedance_transceiver"]
+            if "channel" in da.dims:
+                da = da.sel(channel=ch)
+            return _first_value(da)
+
+    # EK80/WBT default used in many files and Scott's XML.
+    return 10800.0
+
+
+def _extract_impedance_transducer_ohm(ed: Any, beam: Any, ch: str) -> float:
+    """
+    Extract transducer impedance (ohm) from available metadata.
+
+    Many EK80 raw files do not expose this in the parsed xarray groups.
+    Fall back to 75 ohm (used by Scott's calibration XML).
+    """
+    if "impedance_transducer" in beam.variables:
+        da = beam["impedance_transducer"]
+        if "channel" in da.dims:
+            da = da.sel(channel=ch)
+        return _first_value(da)
+
+    if "Vendor_specific" in ed.group_paths:
+        vendor = ed["Vendor_specific"]
+        if "impedance_transducer" in vendor.variables:
+            da = vendor["impedance_transducer"]
+            if "channel" in da.dims:
+                da = da.sel(channel=ch)
+            return _first_value(da)
+
+    return 75.0
+
+
 def build_channel_data(base_data: Dict[str, Any], ch: str) -> Dict[str, Any]:
     """Create a channel-specific data dict for detection."""
     beam = base_data["beam"]
@@ -90,7 +157,15 @@ def build_channel_data(base_data: Dict[str, Any], ch: str) -> Dict[str, Any]:
     sound_speed = _extract_sound_speed(ed, beam, ds_Sv, ch)
     beamwidth_alongship = _first_value(beam["beamwidth_twoway_alongship"].sel(channel=ch))
     beamwidth_athwartship = _first_value(beam["beamwidth_twoway_athwartship"].sel(channel=ch))
+    angle_sensitivity_alongship = _first_value(beam["angle_sensitivity_alongship"].sel(channel=ch))
+    angle_sensitivity_athwartship = _first_value(beam["angle_sensitivity_athwartship"].sel(channel=ch))
+    angle_offset_alongship = _first_value(beam["angle_offset_alongship"].sel(channel=ch))
+    angle_offset_athwartship = _first_value(beam["angle_offset_athwartship"].sel(channel=ch))
     sample_spacing_s = _compute_sample_spacing_s(beam, ds_Sv, ch, sound_speed)
+    gain_db = _extract_gain_db(ds_Sv, ch)
+    freq_hz = _extract_frequency_hz(beam, ch)
+    impedance_transceiver_ohm = _extract_impedance_transceiver_ohm(ed, beam, ch)
+    impedance_transducer_ohm = _extract_impedance_transducer_ohm(ed, beam, ch)
 
     out = dict(base_data)
     out.update(
@@ -100,7 +175,16 @@ def build_channel_data(base_data: Dict[str, Any], ch: str) -> Dict[str, Any]:
             "sound_speed": sound_speed,
             "beamwidth_alongship": beamwidth_alongship,
             "beamwidth_athwartship": beamwidth_athwartship,
+            "angle_sensitivity_alongship": angle_sensitivity_alongship,
+            "angle_sensitivity_athwartship": angle_sensitivity_athwartship,
+            "angle_offset_alongship": angle_offset_alongship,
+            "angle_offset_athwartship": angle_offset_athwartship,
             "sample_spacing_s": sample_spacing_s,
+            "gain_db": gain_db,
+            "gain_db_from_file": gain_db,
+            "freq_hz": freq_hz,
+            "impedance_transceiver_ohm": impedance_transceiver_ohm,
+            "impedance_transducer_ohm": impedance_transducer_ohm,
         }
     )
     return out
@@ -112,6 +196,7 @@ def load_raw_file(filepath: str) -> Dict[str, Any]:
     """
     ed = ep.open_raw(filepath, sonar_model="EK80")
     ds_Sv = ep.calibrate.compute_Sv(ed, waveform_mode="CW", encode_mode="complex")
+    ds_TS = ep.calibrate.compute_TS(ed, waveform_mode="CW", encode_mode="complex")
     beam = ed["Sonar/Beam_group1"]
 
     beam_type = beam["beam_type"].values
@@ -133,12 +218,21 @@ def load_raw_file(filepath: str) -> Dict[str, Any]:
 
     beamwidth_alongship = _first_value(beam["beamwidth_twoway_alongship"].sel(channel=ch_splitbeam))
     beamwidth_athwartship = _first_value(beam["beamwidth_twoway_athwartship"].sel(channel=ch_splitbeam))
+    angle_sensitivity_alongship = _first_value(beam["angle_sensitivity_alongship"].sel(channel=ch_splitbeam))
+    angle_sensitivity_athwartship = _first_value(beam["angle_sensitivity_athwartship"].sel(channel=ch_splitbeam))
+    angle_offset_alongship = _first_value(beam["angle_offset_alongship"].sel(channel=ch_splitbeam))
+    angle_offset_athwartship = _first_value(beam["angle_offset_athwartship"].sel(channel=ch_splitbeam))
 
     sample_spacing_s = _compute_sample_spacing_s(beam, ds_Sv, ch_splitbeam, sound_speed)
+    gain_db = _extract_gain_db(ds_Sv, ch_splitbeam)
+    freq_hz = _extract_frequency_hz(beam, ch_splitbeam)
+    impedance_transceiver_ohm = _extract_impedance_transceiver_ohm(ed, beam, ch_splitbeam)
+    impedance_transducer_ohm = _extract_impedance_transducer_ohm(ed, beam, ch_splitbeam)
 
     return {
         "ed": ed,
         "ds_Sv": ds_Sv,
+        "ds_TS": ds_TS,
         "beam": beam,
         "ch_splitbeam": ch_splitbeam,
         "ch_splitbeam_all": ch_splitbeam_all,
@@ -147,6 +241,15 @@ def load_raw_file(filepath: str) -> Dict[str, Any]:
         "sound_speed": sound_speed,
         "beamwidth_alongship": beamwidth_alongship,
         "beamwidth_athwartship": beamwidth_athwartship,
+        "angle_sensitivity_alongship": angle_sensitivity_alongship,
+        "angle_sensitivity_athwartship": angle_sensitivity_athwartship,
+        "angle_offset_alongship": angle_offset_alongship,
+        "angle_offset_athwartship": angle_offset_athwartship,
         "sample_spacing_s": sample_spacing_s,
+        "gain_db": gain_db,
+        "gain_db_from_file": gain_db,
+        "freq_hz": freq_hz,
+        "impedance_transceiver_ohm": impedance_transceiver_ohm,
+        "impedance_transducer_ohm": impedance_transducer_ohm,
     }
 

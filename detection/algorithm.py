@@ -11,6 +11,70 @@ from scipy.signal import find_peaks
 from detection.compensation import compute_beam_compensation
 
 
+def _safe_channel_value(ds: Any, var_name: str, ch: Any, default: float) -> float:
+    """Get a channel value if present, otherwise return default."""
+    if var_name not in ds.variables:
+        return float(default)
+    da = ds[var_name]
+    if "channel" in da.dims:
+        da = da.sel(channel=ch)
+    vals = np.asarray(da.values, dtype=float).reshape(-1)
+    if vals.size == 0:
+        return float(default)
+    v = float(vals[0])
+    if np.isnan(v):
+        return float(default)
+    return v
+
+
+def _compute_ts_db(iq: np.ndarray, data: Dict[str, Any], params: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert complex EK80 split-beam IQ samples to uncalibrated TS (dB re 1 m^2).
+
+    EK80 CW TS equation:
+    TS = Pr + 20*log10(R) + 2*alpha*R
+         - 10*log10(Pt) - 2*G0 - 20*log10(lambda) + 10*log10(16*pi^2)
+    """
+    ch = data["ch_splitbeam"]
+    ds_Sv = data["ds_Sv"]
+    ds_TS = data.get("ds_TS")
+
+    # Prefer echopype-calibrated TS for EK80-consistent metadata use
+    # (transmit power, frequency, absorption, sound speed, and impedance terms).
+    if ds_TS is not None and "TS" in ds_TS.variables:
+        ts_da = ds_TS["TS"]
+        if "channel" in ts_da.dims:
+            ts_da = ts_da.sel(channel=ch)
+        ts_db = np.asarray(ts_da.values, dtype=float)
+
+        # Apply user gain offset as a gain-term change in the sonar equation.
+        # TS contains -2*G, so delta_gain maps to -2*delta_gain in TS.
+        gain_offset_db = float(data.get("gain_db", data.get("gain_db_from_file", 0.0))) - float(
+            data.get("gain_db_from_file", 0.0)
+        )
+        if gain_offset_db != 0.0:
+            ts_db = ts_db - 2.0 * gain_offset_db
+
+        if "echo_range" in ds_TS.coords or "echo_range" in ds_TS.variables:
+            range_da = ds_TS["echo_range"]
+        elif "echo_range" in ds_Sv.coords or "echo_range" in ds_Sv.variables:
+            range_da = ds_Sv["echo_range"]
+        else:
+            raise ValueError("Could not find `echo_range` in TS/Sv datasets.")
+
+        if "channel" in range_da.dims:
+            range_da = range_da.sel(channel=ch)
+        range_m = np.asarray(range_da.values, dtype=float)
+        if range_m.ndim == 1:
+            range_m_2d = np.broadcast_to(range_m[np.newaxis, :], ts_db.shape)
+        else:
+            range_m_2d = range_m
+        range_m_2d = np.where(range_m_2d <= 0, 1e-6, range_m_2d)
+        return ts_db, range_m_2d
+
+    raise ValueError("Could not find calibrated TS in loaded data. Expected `ds_TS['TS']`.")
+
+
 def _window_within_minus_6db(power_row: np.ndarray, peak_idx: int, peak_val: float) -> np.ndarray:
     threshold = peak_val - 6.0
     left = peak_idx
@@ -50,18 +114,9 @@ def detect_single_targets(
     bs_i = beam["backscatter_i"].sel(channel=ch).values
     iq = bs_r + 1j * bs_i
 
-    # Use total received power (incoherent sector-power sum) for amplitude gating.
-    # Coherent summation of complex sectors can introduce phase-cancellation bias.
-    power_linear = np.sum(np.abs(iq) ** 2, axis=-1)
-    power_db = 10.0 * np.log10(power_linear + 1e-20)
+    ts_db, range_m_arr = _compute_ts_db(iq=iq, data=data, params=params)
 
     ping_times = beam.ping_time.values
-    if "echo_range" in data["ds_Sv"].coords:
-        range_m_arr = data["ds_Sv"]["echo_range"].sel(channel=ch).values.astype(float)
-    elif "echo_range" in data["ds_Sv"].variables:
-        range_m_arr = data["ds_Sv"]["echo_range"].sel(channel=ch).values.astype(float)
-    else:
-        range_m_arr = beam.range_sample.values.astype(float)
 
     mgc = float(params["max_gain_compensation_db"])
     ts_min = float(params["ts_min_db"])
@@ -77,7 +132,7 @@ def detect_single_targets(
     min_range_m = float(min_range_m) if min_range_m is not None else None
     max_range_m = float(max_range_m) if max_range_m is not None else None
 
-    n_pings = power_db.shape[0]
+    n_pings = ts_db.shape[0]
     detections: List[Dict[str, Any]] = []
 
     n_candidates_after_amplitude = 0
@@ -87,11 +142,13 @@ def detect_single_targets(
     n_rejected_depth = 0
     n_phase_gate_skipped = 0
 
-    angle_factor_along = float(data["beamwidth_alongship"]) / (2.0 * np.pi)
-    angle_factor_athwart = float(data["beamwidth_athwartship"]) / (2.0 * np.pi)
+    angle_sens_along = float(data["angle_sensitivity_alongship"])
+    angle_sens_athwart = float(data["angle_sensitivity_athwartship"])
+    angle_offset_along = float(data["angle_offset_alongship"])
+    angle_offset_athwart = float(data["angle_offset_athwartship"])
 
     for ping_idx in range(n_pings):
-        row = power_db[ping_idx, :]
+        row = ts_db[ping_idx, :]
         peaks, _ = find_peaks(row, height=th1, distance=2)
 
         candidates: List[Tuple[int, int]] = []
@@ -144,9 +201,9 @@ def detect_single_targets(
                 )
 
                 # Convert electrical phase (rad) to mechanical angle (deg)
-                # before computing std/gating, so units match phase_std_max_deg.
-                phase_along_deg = phase_along * angle_factor_along
-                phase_athwart_deg = phase_athwart * angle_factor_athwart
+                # using EK80 channel calibration sensitivities and offsets.
+                phase_along_deg = (phase_along * 180.0 / np.pi) / angle_sens_along + angle_offset_along
+                phase_athwart_deg = (phase_athwart * 180.0 / np.pi) / angle_sens_athwart + angle_offset_athwart
 
                 std_along_deg = float(np.std(phase_along_deg))
                 std_athwart_deg = float(np.std(phase_athwart_deg))

@@ -115,6 +115,19 @@ with st.sidebar:
                 st.session_state.detections_df = None
                 st.session_state.diagnostics = None
 
+    st.subheader("Calibration")
+    gain_offset_db = st.number_input(
+        "TS Gain offset (dB)  [CalTS_gain - OrigTS_gain]",
+        value=0.0,
+        step=0.1,
+        format="%.2f",
+        help=(
+            "Add this to the file's transducer gain (CalTSGain - OrigTSGain). "
+            "Because TS includes -2*Gain, a positive offset lowers TS by 2x that amount. "
+            "Leave at 0 if file is already calibrated."
+        ),
+    )
+
     st.markdown("── Detection Parameters ──")
     with st.form("detection_form"):
         ts_min_db = st.number_input("TSmin (dB)", min_value=-80.0, max_value=-20.0, value=-60.0, step=1.0)
@@ -179,6 +192,7 @@ if run_detection:
                 st.error("No split-beam channel available for detection.")
                 st.stop()
             data = build_channel_data(data, st.session_state.selected_channel)
+            data["gain_db"] = float(data["gain_db_from_file"]) + float(gain_offset_db)
         except Exception as e:
             st.error(f"Failed to prepare selected channel: {e}")
             data = None
@@ -274,14 +288,33 @@ with tab1:
         st.info("Upload a .raw file to view echogram and detections.")
     else:
         ch_plot = st.session_state.selected_channel or data["ch_splitbeam"]
-        fig = plot_echogram(
+        detections_for_plot = st.session_state.detections_df if st.session_state.detections_df is not None else pd.DataFrame()
+
+        fig_sv = plot_echogram(
             data["ds_Sv"],
-            st.session_state.detections_df if st.session_state.detections_df is not None else pd.DataFrame(),
+            detections_for_plot,
             ch_plot,
-            title=st.session_state.loaded_filename or "Echogram",
+            value_var="Sv",
+            title=f"{st.session_state.loaded_filename or 'Echogram'} | Sv",
         )
-        st.plotly_chart(fig, use_container_width=True)
-        st.info("White circles indicate accepted single target detections. Hover for TS and angle values.")
+        st.plotly_chart(fig_sv, use_container_width=True)
+
+        if "ds_TS" in data and data["ds_TS"] is not None:
+            fig_ts = plot_echogram(
+                data["ds_TS"],
+                detections_for_plot,
+                ch_plot,
+                value_var="TS",
+                title=f"{st.session_state.loaded_filename or 'Echogram'} | TS",
+            )
+            st.plotly_chart(fig_ts, use_container_width=True)
+        else:
+            st.info("TS echogram unavailable for this file load.")
+
+        st.info(
+            "Top panel: Sv echogram. Bottom panel: TS echogram. "
+            "White circles indicate accepted single-target detections."
+        )
 
 with tab2:
     df = st.session_state.detections_df
