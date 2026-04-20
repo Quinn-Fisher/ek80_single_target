@@ -97,54 +97,145 @@ This follows TS equation gain sign (`-2*G`).
 
 ---
 
-## Exact Detection Pipeline
+## Exact Detection Pipeline (Hydroacoustics-Focused)
 
 Implemented in `detection/algorithm.py`.
 
-1. **Build IQ**
-   - `iq = backscatter_r + 1j * backscatter_i`
+This section is intentionally detailed for non-programmers. Think of the detector as a sequence of "keep/reject" tests applied to every potential echo peak.
 
-2. **Uncompensated TS source**
-   - Uses `ds_TS["TS"]` from `ep.calibrate.compute_TS(..., waveform_mode="CW", encode_mode="complex")`
-   - Applies user gain offset in TS space (`-2 * gain_offset_db`)
+### Symbols and terms used below
 
-3. **Amplitude candidate thresholds**
-   - `th1 = ts_min - (2*mgc + 6)`
-   - `th2 = ts_min - ((2*mgc + 6)/2)`
-   - `th3 = ts_min`
-   - Peaks from `find_peaks(row, height=th1, distance=2)`
+- `TS`: target strength in dB re 1 m^2
+- `TSmin`: final compensated TS threshold
+- `mgc`: max gain compensation in dB
+- `R`: range in meters
+- "alongship / athwartship": split-beam angle axes
+- "window": contiguous samples around a peak above `peak - 6 dB`
 
-4. **Optional depth gate**
-   - reject outside `[min_range_m, max_range_m]`
+### Step 1: Build complex split-beam signal
 
-5. **Pulse-width gate**
-   - contiguous `-6 dB` window around peak
-   - `normalized_width = (n_samples * sample_spacing_s) / pulse_duration_s`
-   - keep only within `[min_npw, max_npw]`
+For each ping and sample:
+- `iq = backscatter_r + 1j * backscatter_i`
 
-6. **Phase stability gate**
-   - if fewer than 3 samples in window: skip phase gate for that candidate
-   - alongship phase: sector 0 vs 1
-   - athwartship phase: sector 2 vs average(0,1)
-   - convert electrical phase to mechanical angle with EK80 metadata:
-     - `angle = (phase_rad * 180/pi) / angle_sensitivity + angle_offset`
-   - reject if std of either axis exceeds `phase_std_max_deg`
+This preserves both:
+- amplitude (echo strength)
+- phase (used for split-beam angle stability tests)
 
-7. **Beam compensation**
-   - `comp = 6.0206 * ((along/(bw_along/2))^2 + (athwart/(bw_athwart/2))^2)`
-   - `bw_*` are EK80 two-way metadata and converted to one-way in denominator
-   - capped at `max_gain_compensation_db`
+### Step 2: Get uncompensated TS baseline
 
-8. **Final TS gate**
-   - `ts_compensated = ts_uncompensated + comp`
-   - keep if `ts_compensated >= ts_min`
+The detector does **not** re-derive TS from scratch using custom constants.
+It uses EK80-calibrated TS from `echopype`:
 
-9. **Outputs**
-   - detection table with range, angles, TS, compensation, pulse width, phase std, tier, skip flag
-   - diagnostics counters at each rejection stage
+- `ds_TS = ep.calibrate.compute_TS(ed, waveform_mode="CW", encode_mode="complex")`
+- per-sample baseline is `ds_TS["TS"]`
 
-Candidate accounting:
-`Accepted = Candidates - Rejected(depth) - Rejected(duration) - Rejected(phase) - Rejected(final TS)`
+Then user gain offset is applied in TS space:
+- `TS_adjusted = TS_from_echopype - 2 * gain_offset_db`
+
+Why `-2`? Because TS equation gain term is `-2G`.
+
+### Step 3: Build three candidate thresholds
+
+Using `TSmin` and `mgc`, the code defines:
+
+- `th1 = TSmin - (2*mgc + 6)` (most permissive)
+- `th2 = TSmin - ((2*mgc + 6)/2)` (intermediate)
+- `th3 = TSmin` (strictest)
+
+Then local peaks are found on the uncompensated TS trace:
+- peak height must be at least `th1`
+- peaks must be separated by at least 2 samples
+
+Each peak is labeled by strongest threshold passed (tier 1/2/3).
+
+### Step 4: Optional analysis range gate
+
+If enabled in UI, candidate is rejected outside:
+- `[min_range_m, max_range_m]`
+
+This is a temporary diagnostic range window, not a bottom detector.
+
+### Step 5: Pulse-width shape gate
+
+For each surviving peak:
+1. Find contiguous samples above `peak - 6 dB`.
+2. Count samples in that window (`n_samples`).
+3. Compute:
+   - `actual_duration_s = n_samples * sample_spacing_s`
+   - `normalized_pulse_width = actual_duration_s / pulse_duration_s`
+
+Candidate passes only if:
+- `min_normalized_pulse_width <= normalized_pulse_width <= max_normalized_pulse_width`
+
+Interpretation:
+- too narrow -> often impulsive/noise spike
+- too wide -> often multiple/extended/overlapping returns
+
+### Step 6: Phase stability gate (single-target discriminator)
+
+If `n_samples < 3`, phase gate is skipped for that candidate (tracked in diagnostics).
+
+Otherwise:
+1. Compute electrical phase-difference series:
+   - alongship: sector `0` vs `1`
+   - athwartship: sector `2` vs average of `0` and `1`
+2. Convert phase to mechanical angle with EK80 channel calibration:
+   - `angle_deg = (phase_rad * 180/pi) / angle_sensitivity + angle_offset`
+3. Compute std dev on each axis.
+4. Reject candidate if either std exceeds `phase_std_max_deg`.
+
+Conceptually:
+- low phase std -> stable single target
+- high phase std -> mixed or unstable return
+
+### Step 7: Beam compensation
+
+For accepted angle estimates, compensation is:
+
+- `comp_db = 6.0206 * ((along/(bw_along/2))^2 + (athwart/(bw_athwart/2))^2)`
+- clipped at `max_gain_compensation_db`
+
+Important convention:
+- EK80 metadata provides two-way beamwidth
+- equation denominator uses one-way width, so code uses `bw/2`
+
+### Step 8: Final TS acceptance
+
+Compensated TS is:
+- `TScomp = TSuncomp + comp_db`
+
+Final pass condition:
+- `TScomp >= TSmin`
+
+### Step 9: Output row and diagnostics
+
+Each accepted target stores:
+- ping/time/range
+- along/athwart angle
+- uncompensated and compensated TS
+- phase std values
+- normalized pulse width
+- compensation
+- threshold tier
+- phase-gate-skipped flag
+
+Diagnostics store counts for:
+- candidates found
+- rejected by depth/range gate
+- rejected by duration gate
+- rejected by phase gate
+- rejected by final TS
+- accepted targets
+
+Accounting identity:
+- `Accepted = Candidates - Rejected(depth) - Rejected(duration) - Rejected(phase) - Rejected(final TS)`
+
+### Practical interpretation of diagnostics
+
+- large `Rejected(depth)` -> range gate is likely too narrow or misplaced
+- large `Rejected(duration)` -> pulse-width bounds likely too strict
+- large `Rejected(phase)` -> phase std gate likely too strict for current SNR/echo shape
+- large `Rejected(final TS)` -> `TSmin` likely too high for target population
 
 ---
 
