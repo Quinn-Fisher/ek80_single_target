@@ -32,7 +32,7 @@ single_target/
 ## Requirements
 
 - Python 3.10+ (3.11/3.12 works with current dependencies)
-- EK80 `.raw` with at least one split-beam channel (`beam_type == 17`)
+- EK80 `.raw` with at least one split-beam channel (`beam_type` in `{1, 17, 49, 65, 81}`)
 
 Install:
 
@@ -112,14 +112,15 @@ This section is intentionally detailed for non-programmers. Think of the detecto
 - "alongship / athwartship": split-beam angle axes
 - "window": contiguous samples around a peak above `peak - 6 dB`
 
-### Step 1: Build complex split-beam signal
+### Step 1: Pre-compute split-beam angles
 
-For each ping and sample:
-- `iq = backscatter_r + 1j * backscatter_i`
+Once per file, before the detection loop:
+- `get_splitbeam_angles(ed, ds_Sv, ch_splitbeam)` is called
+- Internally calls `ep.consolidate.add_splitbeam_angle()` (EchoPype's validated decoder)
+- Returns `angle_along`, `angle_athwart` as `(ping, range)` arrays in mechanical degrees
+- Angle offsets are baked in when calibration overrides are passed to `compute_Sv`
 
-This preserves both:
-- amplitude (echo strength)
-- phase (used for split-beam angle stability tests)
+This replaces per-ping IQ cross-product computation. The EchoPype decoder handles all transducer geometries (`beam_type` 1, 17, 49, 65, 81) including the 3-sector ES38-18 combi transducer.
 
 ### Step 2: Get uncompensated TS baseline
 
@@ -134,19 +135,50 @@ Then user gain offset is applied in TS space:
 
 Why `-2`? Because TS equation gain term is `-2G`.
 
-### Step 3: Build three candidate thresholds
+### Step 3: Pre-smooth the signal, then find candidate echo peaks
 
-Using `TSmin` and `mgc`, the code defines:
+#### 3a — Signal smoothing before peak detection (Stage 1)
 
-- `th1 = TSmin - (2*mgc + 6)` (most permissive)
-- `th2 = TSmin - ((2*mgc + 6)/2)` (intermediate)
-- `th3 = TSmin` (strictest)
+Before searching for peaks, the TS trace for each ping is gently smoothed by
+averaging each sample with the one immediately before it. This is done in the
+linear power domain (not in dB) to avoid distortion, then converted back to dB.
+The result is a 2-sample causal running average — "causal" means it only uses
+the current and immediately preceding sample, so it cannot introduce echoes from
+the future.
 
-Then local peaks are found on the uncompensated TS trace:
-- peak height must be at least `th1`
-- peaks must be separated by at least 2 samples
+**Why this matters.** With only ~4 samples per echo (for a 0.256 ms pulse at
+Lake Superior sampling rates), a single noisy sample can create a spurious peak
+or shift the true peak by one sample. The smoothed trace is less sensitive to
+these single-sample fluctuations and matches the pre-smoothing step in the ESP3
+MATLAB reference implementation.
 
-Each peak is labeled by strongest threshold passed (tier 1/2/3).
+**Important:** the smoothed trace is used only for finding peak locations. All
+subsequent measurements — TS value, pulse width, phase angles — are read from
+the original unsmoothed data. Smoothing is purely a peak-locator aid.
+
+#### 3b — Amplitude thresholds
+
+Three acceptance tiers are defined from `TSmin` and `mgc` (max gain compensation):
+
+- `th1 = TSmin − (2·mgc + 6)` — most permissive floor; screens out obvious noise
+- `th2 = TSmin − (2·mgc + 6)/2` — intermediate
+- `th3 = TSmin` — strictest; candidate already passes the final TS test
+
+Each peak is labelled with the strictest tier it clears. All peaks go through
+the remaining gates regardless of tier — tier is recorded for diagnostics only.
+
+#### 3c — Minimum separation between peaks (Stage 2)
+
+Two peaks must be separated by at least one full pulse length in samples —
+computed as `round(pulse_duration / sample_spacing)` rather than the previous
+fixed value of 2 samples.
+
+**Why this matters.** A single fish echo spans roughly one pulse length. If
+two peaks can sit only 2 samples apart but a pulse is ~4 samples wide, both
+peaks may originate from the same fish. With the minimum separation set to one
+pulse length, the detector is prevented from splitting a single fish echo into
+two candidates. This is the primary safeguard against duplicate detections and
+matches the `MinSeparation = Np` logic in the ESP3 reference.
 
 ### Step 4: Optional analysis range gate
 
@@ -173,20 +205,32 @@ Interpretation:
 
 ### Step 6: Phase stability gate (single-target discriminator)
 
-If `n_samples < 3`, phase gate is skipped for that candidate (tracked in diagnostics).
+Angles for the echo window are looked up from the pre-computed arrays:
+- `window_along   = angle_along[ping_idx, window_idx]`
+- `window_athwart = angle_athwart[ping_idx, window_idx]`
+
+NaN values (can occur at range edges in EchoPype output) are removed:
+- `valid = np.isfinite(window_along) & np.isfinite(window_athwart)`
+
+If `n_valid < 3`, phase gate is skipped for that candidate (tracked in diagnostics) and `np.nanmean` is used for the angle estimate.
 
 Otherwise:
-1. Compute electrical phase-difference series:
-   - alongship: sector `0` vs `1`
-   - athwartship: sector `2` vs average of `0` and `1`
-2. Convert phase to mechanical angle with EK80 channel calibration:
-   - `angle_deg = (phase_rad * 180/pi) / angle_sensitivity + angle_offset`
-3. Compute std dev on each axis.
-4. Reject candidate if either std exceeds `phase_std_max_deg`.
+1. Compute std dev on each axis using only the valid samples, with the
+   **N−1 denominator** (Bessel's correction, also called `ddof=1`).
+2. Reject candidate if either std exceeds `phase_std_max_deg`.
+3. Use `np.mean` of valid samples as the angle estimate.
 
 Conceptually:
-- low phase std -> stable single target
-- high phase std -> mixed or unstable return
+- low phase std → stable single target (the echo came from one direction throughout)
+- high phase std → mixed or unstable return (possibly two fish close together, or noise)
+
+**Why N−1 rather than N?** When the standard deviation is computed over a small
+number of samples — typically 3–4 for a short pulse — the N denominator
+systematically underestimates the true variability. The N−1 correction (Bessel's
+correction) gives a better estimate and matches the behaviour of MATLAB's
+`nanstd`, which the ESP3 reference uses. In practice, for a 4-sample window, the
+N−1 std is about 15% larger than the N std, making the phase gate marginally
+stricter. For longer windows the difference becomes negligible.
 
 ### Step 7: Beam compensation
 
@@ -207,7 +251,32 @@ Compensated TS is:
 Final pass condition:
 - `TScomp >= TSmin`
 
-### Step 9: Output row and diagnostics
+### Step 9: Within-ping overlap deduplication (Stage 6)
+
+After all gates have passed, one final check runs across all detections collected
+from the same ping before they are saved.
+
+**What it does.** For every pair of detections within the same ping, the code
+checks whether their echo windows (the contiguous samples above −6 dB of each
+peak) overlap in range. If they do, only the detection with the higher
+compensated TS is kept; the other is discarded.
+
+**Why this is necessary.** Even with the minimum peak separation set to one
+pulse length (Step 3c), two peaks can occasionally survive from the same fish
+echo — for example when a noise spike sits just outside the separation gate, or
+when the smoothed and unsmoothed peaks are slightly offset. Without this step,
+both detections enter the output CSV and appear to the downstream tracker as two
+separate fish at almost identical depth in the same ping. The tracker then either
+creates a phantom short track for the weaker duplicate, or fragments a genuine
+track. Keeping only the stronger of any overlapping pair removes this artefact
+before it propagates.
+
+**Order of deduplication.** Detections within a ping are ranked by compensated
+TS from highest to lowest. The strongest detection is always kept. Each
+subsequent detection is only kept if its window does not overlap with any already
+accepted detection from that ping.
+
+### Step 10: Output row and diagnostics
 
 Each accepted target stores:
 - ping/time/range
@@ -245,7 +314,7 @@ Accounting identity:
 1. `ep.open_raw(..., sonar_model="EK80")`
 2. `ep.calibrate.compute_Sv(..., waveform_mode="CW", encode_mode="complex")`
 3. `ep.calibrate.compute_TS(..., waveform_mode="CW", encode_mode="complex")`
-4. picks split-beam channel(s)
+4. picks split-beam channel via `get_splitbeam_channel(ed)` — selects by `beam_type` from `{1, 17, 49, 65, 81}`, prefers lowest frequency if multiple are present
 5. extracts channel metadata:
    - pulse duration
    - sound speed (Beam -> Environment -> Sv fallback)
@@ -256,7 +325,9 @@ Accounting identity:
    - impedances (with defaults when missing)
 6. computes sample spacing from physical range spacing (`echo_range` preferred)
 
-`build_channel_data(base_data, ch)` applies this for selected channel.
+`build_channel_data(base_data, ch)` applies this for a selected channel.
+
+`get_splitbeam_angles(ed, ds_Sv, ch_splitbeam)` computes decoded split-beam angles once per file using `ep.consolidate.add_splitbeam_angle()`. Called at the start of `detect_single_targets()` before the ping loop. Handles both complex (EK80 CW/BB) and power/angle (EK60, EK80 power mode) data paths.
 
 ---
 
@@ -301,19 +372,6 @@ The script prints:
 - dominant rejection stage from diagnostics
 
 Defaults are intentionally calibration-oriented. Adjust args as needed for survey/fish runs.
-
----
-
-## Changes vs Public Repo
-
-Relative to public `main` at [Quinn-Fisher/ek80_single_target](https://github.com/Quinn-Fisher/ek80_single_target):
-
-- uncompensated TS now sourced from `echopype.compute_TS` rather than ad hoc power-only scaling
-- explicit gain-offset semantics applied in TS domain (`-2*offset`)
-- phase-angle conversion now uses EK80 angle sensitivity/offset metadata
-- beam compensation uses one-way beamwidth denominator derived from EK80 two-way fields
-- Echogram tab now shows both `Sv` and `TS` panels
-- added/expanded `verify_calibration.py` for XML-vs-app reproducible calibration checks
 
 ---
 

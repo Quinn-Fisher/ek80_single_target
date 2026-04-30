@@ -9,6 +9,7 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 from detection.compensation import compute_beam_compensation
+from detection.loader import get_splitbeam_angles
 
 
 def _safe_channel_value(ds: Any, var_name: str, ch: Any, default: float) -> float:
@@ -27,7 +28,7 @@ def _safe_channel_value(ds: Any, var_name: str, ch: Any, default: float) -> floa
     return v
 
 
-def _compute_ts_db(iq: np.ndarray, data: Dict[str, Any], params: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
+def _compute_ts_db(data: Dict[str, Any], params: Dict[str, float]) -> Tuple[np.ndarray, np.ndarray]:
     """
     Convert complex EK80 split-beam IQ samples to uncalibrated TS (dB re 1 m^2).
 
@@ -110,11 +111,7 @@ def detect_single_targets(
     pulse_dur = float(data["pulse_duration_s"])
     sample_spacing_s = float(data["sample_spacing_s"])
 
-    bs_r = beam["backscatter_r"].sel(channel=ch).values
-    bs_i = beam["backscatter_i"].sel(channel=ch).values
-    iq = bs_r + 1j * bs_i
-
-    ts_db, range_m_arr = _compute_ts_db(iq=iq, data=data, params=params)
+    ts_db, range_m_arr = _compute_ts_db(data=data, params=params)
 
     ping_times = beam.ping_time.values
 
@@ -142,14 +139,17 @@ def detect_single_targets(
     n_rejected_depth = 0
     n_phase_gate_skipped = 0
 
-    angle_sens_along = float(data["angle_sensitivity_alongship"])
-    angle_sens_athwart = float(data["angle_sensitivity_athwartship"])
-    angle_offset_along = float(data["angle_offset_alongship"])
-    angle_offset_athwart = float(data["angle_offset_athwartship"])
+    angle_along, angle_athwart = get_splitbeam_angles(
+        data["ed"], data["ds_Sv"], data["ch_splitbeam"]
+    )
 
     for ping_idx in range(n_pings):
         row = ts_db[ping_idx, :]
-        peaks, _ = find_peaks(row, height=th1, distance=2)
+        # Stage 1: match ESP3 half-pulse-length boxcar smoothing.
+        row_linear = 10.0 ** (row / 10.0)
+        row_smoothed_db = 10.0 * np.log10(np.maximum(np.convolve(row_linear, np.ones(2) / 2.0, mode="full")[: row.size], 1e-30))
+        # Stage 2: match ESP3 minimum separation of one pulse length.
+        peaks, _ = find_peaks(row_smoothed_db, height=th1, distance=round(pulse_dur / sample_spacing_s))
 
         candidates: List[Tuple[int, int]] = []
         for p in peaks:
@@ -163,6 +163,7 @@ def detect_single_targets(
                 candidates.append((int(p), 1))
 
         n_candidates_after_amplitude += len(candidates)
+        ping_detections: List[Dict[str, Any]] = []
 
         for peak_idx, level in candidates:
             range_val_m = _range_at(range_m_arr, ping_idx, peak_idx)
@@ -190,30 +191,27 @@ def detect_single_targets(
             angle_along_deg = 0.0
             angle_athwart_deg = 0.0
 
-            if n_samples < 3:
+            window_along = angle_along[ping_idx, window_idx]
+            window_athwart = angle_athwart[ping_idx, window_idx]
+            valid = np.isfinite(window_along) & np.isfinite(window_athwart)
+            n_valid = int(valid.sum())
+
+            if n_valid < 3:
                 phase_gate_skipped = True
                 n_phase_gate_skipped += 1
+                angle_along_deg = float(np.nanmean(window_along))
+                angle_athwart_deg = float(np.nanmean(window_athwart))
             else:
-                phase_along = np.angle(iq[ping_idx, window_idx, 0] * np.conj(iq[ping_idx, window_idx, 1]))
-                phase_athwart = np.angle(
-                    iq[ping_idx, window_idx, 2]
-                    * np.conj((iq[ping_idx, window_idx, 0] + iq[ping_idx, window_idx, 1]) / 2.0)
-                )
-
-                # Convert electrical phase (rad) to mechanical angle (deg)
-                # using EK80 channel calibration sensitivities and offsets.
-                phase_along_deg = (phase_along * 180.0 / np.pi) / angle_sens_along + angle_offset_along
-                phase_athwart_deg = (phase_athwart * 180.0 / np.pi) / angle_sens_athwart + angle_offset_athwart
-
-                std_along_deg = float(np.std(phase_along_deg))
-                std_athwart_deg = float(np.std(phase_athwart_deg))
+                # Stage 5: match ESP3 N-1 denominator.
+                std_along_deg = float(np.std(window_along[valid], ddof=1))
+                std_athwart_deg = float(np.std(window_athwart[valid], ddof=1))
 
                 if std_along_deg > phase_std_max or std_athwart_deg > phase_std_max:
                     n_rejected_phase += 1
                     continue
 
-                angle_along_deg = float(np.mean(phase_along_deg))
-                angle_athwart_deg = float(np.mean(phase_athwart_deg))
+                angle_along_deg = float(np.mean(window_along[valid]))
+                angle_athwart_deg = float(np.mean(window_athwart[valid]))
 
             compensation_db = compute_beam_compensation(
                 angle_along=angle_along_deg,
@@ -228,7 +226,7 @@ def detect_single_targets(
                 n_rejected_final_ts += 1
                 continue
 
-            detections.append(
+            ping_detections.append(
                 {
                     "ping_time": ping_times[ping_idx],
                     "ping_index": ping_idx,
@@ -244,8 +242,20 @@ def detect_single_targets(
                     "compensation_db": float(compensation_db),
                     "threshold_level_passed": level,
                     "phase_gate_skipped": bool(phase_gate_skipped),
+                    "_wmin": int(window_idx[0]),
+                    "_wmax": int(window_idx[-1]),
                 }
             )
+
+        # Stage 6: match ESP3 overlap deduplication.
+        ping_detections.sort(key=lambda d: d["ts_compensated_db"], reverse=True)
+        kept: List[Dict[str, Any]] = []
+        for det in ping_detections:
+            if not any(det["_wmin"] <= k["_wmax"] and det["_wmax"] >= k["_wmin"] for k in kept):
+                kept.append(det)
+        for det in kept:
+            del det["_wmin"], det["_wmax"]
+        detections.extend(kept)
 
         if progress_callback is not None:
             progress_callback(ping_idx + 1, n_pings)

@@ -2,10 +2,92 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import echopype as ep
 import numpy as np
+
+_SPLITBEAM_TYPES = {1, 17, 49, 65, 81}
+
+
+def get_splitbeam_channel(ed: Any) -> str:
+    """
+    Return the channel string for the preferred split-beam channel.
+
+    Selects by beam_type rather than frequency or channel name.
+    If multiple split-beam channels are present, returns the one with the
+    lowest nominal frequency (standard survey practice for the primary channel).
+
+    Raises ValueError if no split-beam channel is found.
+    """
+    beam = ed["Sonar/Beam_group1"]
+    channels = beam.channel.values
+    beam_types = beam["beam_type"].values
+
+    splitbeam_channels = [
+        ch for ch, bt in zip(channels, beam_types)
+        if int(bt) in _SPLITBEAM_TYPES
+    ]
+
+    if not splitbeam_channels:
+        raise ValueError(
+            f"No split-beam channel found. beam_types present: {beam_types.tolist()}. "
+            "Single target detection requires a split-beam transducer."
+        )
+
+    if len(splitbeam_channels) > 1:
+        freqs = beam["frequency_nominal"].values
+        ch_freqs = {
+            ch: float(freqs[list(channels).index(ch)])
+            for ch in splitbeam_channels
+        }
+        return min(ch_freqs, key=ch_freqs.get)
+
+    return splitbeam_channels[0]
+
+
+def get_splitbeam_angles(
+    ed: Any,
+    ds_Sv: Any,
+    ch_splitbeam: str,
+    cal_params: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute decoded split-beam angles using EchoPype's validated implementation.
+
+    Returns angle_along, angle_athwart as numpy arrays of shape (ping_time, range_sample).
+    Must be called after compute_Sv so that cal_params (angle offsets, gain) are already
+    baked into ds_Sv — cal_params here is accepted but unused; pass offsets to compute_Sv.
+
+    Works for EK80 CW complex data (beam_type 1, 17, 49, 65, 81) and EK60/EK80 power/angle data.
+    """
+    # List syntax preserves the channel dimension required by add_splitbeam_angle.
+    ds_38 = ds_Sv.sel(channel=[ch_splitbeam])
+
+    beam = ed["Sonar/Beam_group1"]
+    transmit_type = beam["transmit_type"].sel(channel=ch_splitbeam).values.flat[0]
+
+    if "backscatter_r" in beam.variables:
+        waveform_mode = "CW" if transmit_type == "CW" else "BB"
+        ds_38 = ep.consolidate.add_splitbeam_angle(
+            source_Sv=ds_38,
+            echodata=ed,
+            waveform_mode=waveform_mode,
+            encode_mode="complex",
+            to_disk=False,
+        )
+    else:
+        ds_38 = ep.consolidate.add_splitbeam_angle(
+            source_Sv=ds_38,
+            echodata=ed,
+            waveform_mode="CW",
+            encode_mode="power",
+            to_disk=False,
+        )
+
+    angle_along = ds_38["angle_alongship"].values[0]    # (ping, range)
+    angle_athwart = ds_38["angle_athwartship"].values[0]
+    return angle_along, angle_athwart
 
 
 def _first_value(arr: Any) -> float:
@@ -203,13 +285,11 @@ def load_raw_file(filepath: str) -> Dict[str, Any]:
     channels = beam["channel"].values
     ch_all: List[str] = [str(ch) for ch in channels]
 
-    split_indices = np.where(np.asarray(beam_type) == 17)[0]
-    if split_indices.size == 0:
-        raise ValueError(
-            "No split-beam channel found in this file. Single target detection requires a split-beam transducer."
-        )
-    ch_splitbeam_all = [ch_all[int(i)] for i in split_indices]
-    ch_splitbeam = ch_splitbeam_all[0]
+    ch_splitbeam = get_splitbeam_channel(ed)
+    ch_splitbeam_all = [
+        str(ch) for ch, bt in zip(channels, beam_type)
+        if int(bt) in _SPLITBEAM_TYPES
+    ]
 
     tx_nom = beam["transmit_duration_nominal"].sel(channel=ch_splitbeam)
     pulse_duration_s = _first_value(tx_nom)

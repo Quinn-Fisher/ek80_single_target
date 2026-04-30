@@ -117,14 +117,15 @@ with st.sidebar:
 
     st.subheader("Calibration")
     gain_offset_db = st.number_input(
-        "TS Gain offset (dB)  [CalTS_gain - OrigTS_gain]",
+        "TS Gain offset (dB)  [calibrated − file gain]",
         value=0.0,
         step=0.1,
         format="%.2f",
         help=(
-            "Add this to the file's transducer gain (CalTSGain - OrigTSGain). "
-            "Because TS includes -2*Gain, a positive offset lowers TS by 2x that amount. "
-            "Leave at 0 if file is already calibrated."
+            "Enter (calibrated gain) − (file gain). "
+            "For Lake Superior: calibrated=18.46 dB, file=22.0 dB → enter −3.54. "
+            "A negative value raises TS (corrects an over-estimated file gain). "
+            "Leave at 0 if the file was already calibrated."
         ),
     )
 
@@ -136,19 +137,27 @@ with st.sidebar:
         )
         min_normalized_pulse_width = st.number_input(
             "Min pulse width",
-            min_value=0.3,
-            max_value=1.0,
+            min_value=0.05,
+            max_value=2.0,
             value=0.5,
             step=0.05,
-            help="For short pulses with low samples/pulse (e.g., ~4), 0.5 is a practical starting value.",
+            help=(
+                "Echo duration (at −6 dB) divided by the nominal pulse duration. "
+                "Note: Kongsberg/EV normalise by half the pulse duration, so their value of 0.80 equals 0.40 here. "
+                "For ~4 samples/pulse (survey), 0.5 is practical. For ~32 samples/pulse (calibration), use ~0.4."
+            ),
         )
         max_normalized_pulse_width = st.number_input(
             "Max pulse width",
-            min_value=1.0,
+            min_value=0.05,
             max_value=4.0,
             value=2.0,
             step=0.05,
-            help="Wider upper bound helps retain valid targets when the -6 dB window spans few discrete samples.",
+            help=(
+                "Echo duration (at −6 dB) divided by the nominal pulse duration. "
+                "Note: Kongsberg/EV normalise by half the pulse duration, so their value of 1.80 equals 0.90 here. "
+                "For ~4 samples/pulse (survey), 2.0 is practical. For ~32 samples/pulse (calibration), use ~0.9."
+            ),
         )
         phase_std_max_deg = st.number_input(
             "Phase std max (deg)",
