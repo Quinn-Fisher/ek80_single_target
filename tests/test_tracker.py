@@ -164,18 +164,31 @@ def test_scattered_noise_detections_are_unassigned():
     assert (result["track_id"] == UNASSIGNED_TRACK_ID).all()
 
 
+def _base_time(ping_index: int) -> pd.Timestamp:
+    return pd.Timestamp("2026-01-01") + pd.Timedelta(seconds=ping_index * 0.1)
+
+
 def test_summarize_tracks_aggregates_correctly():
+    ping_index = [0, 1, 2, 5, 6, 7, 8]
     tracked_df = pd.DataFrame(
         {
-            "ping_index": [0, 1, 2, 5, 6, 7, 8],
+            "ping_index": ping_index,
+            "ping_time": [_base_time(i) for i in ping_index],
             "ts_compensated_db": [-30.0, -32.0, -28.0, -20.0, -22.0, -24.0, -18.0],
             "track_id": [0, 0, 0, 1, 1, 1, 1],
+            "range_m": [10.0, 12.0, 11.0, 30.0, 33.0, 28.0, 31.0],
+            # Cartesian columns are unused by range/TS stats -- constant here,
+            # speed behavior is covered by a dedicated test below.
+            "major_axis_m": [0.0] * 7,
+            "minor_axis_m": [0.0] * 7,
+            "range_axis_m": [10.0, 12.0, 11.0, 30.0, 33.0, 28.0, 31.0],
         }
     )
 
     summary = summarize_tracks(tracked_df)
 
     assert list(summary["track_id"]) == [0, 1]
+    assert "equivalent_length_cm" not in summary.columns
 
     row0 = summary[summary["track_id"] == 0].iloc[0]
     assert row0["n_detections"] == 3
@@ -185,6 +198,9 @@ def test_summarize_tracks_aggregates_correctly():
     assert row0["ts_compensated_db_mean"] == pytest.approx((-30.0 - 32.0 - 28.0) / 3.0)
     assert row0["ts_compensated_db_min"] == pytest.approx(-32.0)
     assert row0["ts_compensated_db_max"] == pytest.approx(-28.0)
+    assert row0["range_m_mean"] == pytest.approx((10.0 + 12.0 + 11.0) / 3.0)
+    assert row0["range_m_min"] == pytest.approx(10.0)
+    assert row0["range_m_max"] == pytest.approx(12.0)
 
     row1 = summary[summary["track_id"] == 1].iloc[0]
     assert row1["n_detections"] == 4
@@ -194,15 +210,105 @@ def test_summarize_tracks_aggregates_correctly():
     assert row1["ts_compensated_db_mean"] == pytest.approx((-20.0 - 22.0 - 24.0 - 18.0) / 4.0)
     assert row1["ts_compensated_db_min"] == pytest.approx(-24.0)
     assert row1["ts_compensated_db_max"] == pytest.approx(-18.0)
+    assert row1["range_m_mean"] == pytest.approx((30.0 + 33.0 + 28.0 + 31.0) / 4.0)
+    assert row1["range_m_min"] == pytest.approx(28.0)
+    assert row1["range_m_max"] == pytest.approx(33.0)
 
 
 def test_summarize_tracks_excludes_unassigned():
+    ping_index = [0, 1, 2]
     tracked_df = pd.DataFrame(
         {
-            "ping_index": [0, 1, 2],
+            "ping_index": ping_index,
+            "ping_time": [_base_time(i) for i in ping_index],
             "ts_compensated_db": [-30.0, -31.0, -29.0],
             "track_id": [UNASSIGNED_TRACK_ID, UNASSIGNED_TRACK_ID, UNASSIGNED_TRACK_ID],
+            "range_m": [10.0, 11.0, 12.0],
+            "major_axis_m": [0.0, 0.0, 0.0],
+            "minor_axis_m": [0.0, 0.0, 0.0],
+            "range_axis_m": [10.0, 11.0, 12.0],
         }
     )
     summary = summarize_tracks(tracked_df)
     assert len(summary) == 0
+
+
+def test_summarize_tracks_speed_with_irregular_ping_times():
+    # Single track, constant velocity of 2.0 m/s purely along the minor
+    # axis, but with deliberately irregular ping_time spacing (0.1s, 0.3s,
+    # 0.05s steps) so the test actually exercises real-elapsed-time speed
+    # computation rather than a ping-count approximation. Positions are
+    # chosen to match velocity * elapsed_time exactly, so the expected mean
+    # speed is exactly 2.0 m/s regardless of the irregular spacing.
+    t0 = pd.Timestamp("2026-01-01T00:00:00")
+    dt_steps = [0.1, 0.3, 0.05]  # seconds between consecutive detections
+    times = [t0]
+    for dt in dt_steps:
+        times.append(times[-1] + pd.Timedelta(seconds=dt))
+
+    speed = 2.0
+    minor_positions = [0.0]
+    for dt in dt_steps:
+        minor_positions.append(minor_positions[-1] + speed * dt)
+
+    n = len(times)
+    tracked_df = pd.DataFrame(
+        {
+            "ping_index": list(range(n)),
+            "ping_time": times,
+            "ts_compensated_db": [-30.0] * n,
+            "track_id": [0] * n,
+            "range_m": [20.0] * n,
+            "major_axis_m": [0.0] * n,
+            "minor_axis_m": minor_positions,
+            "range_axis_m": [20.0] * n,
+        }
+    )
+
+    summary = summarize_tracks(tracked_df)
+
+    assert len(summary) == 1
+    assert summary.iloc[0]["speed_m_per_s_mean"] == pytest.approx(2.0, rel=1e-9)
+
+
+def test_summarize_tracks_equivalent_length_present_when_coefficients_given():
+    ping_index = [0, 1, 2]
+    tracked_df = pd.DataFrame(
+        {
+            "ping_index": ping_index,
+            "ping_time": [_base_time(i) for i in ping_index],
+            "ts_compensated_db": [-40.0, -40.0, -40.0],
+            "track_id": [0, 0, 0],
+            "range_m": [15.0, 15.0, 15.0],
+            "major_axis_m": [0.0, 0.0, 0.0],
+            "minor_axis_m": [0.0, 0.0, 0.0],
+            "range_axis_m": [15.0, 15.0, 15.0],
+        }
+    )
+
+    ts_length_a, ts_length_b = 20.0, -68.0
+    summary = summarize_tracks(tracked_df, ts_length_a=ts_length_a, ts_length_b=ts_length_b)
+
+    assert "equivalent_length_cm" in summary.columns
+    expected_length_cm = 10 ** ((-40.0 - ts_length_b) / ts_length_a)
+    assert summary.iloc[0]["equivalent_length_cm"] == pytest.approx(expected_length_cm)
+
+    # Default call (no coefficients) must not include the column at all.
+    summary_default = summarize_tracks(tracked_df)
+    assert "equivalent_length_cm" not in summary_default.columns
+
+
+def test_assign_tracks_output_includes_local_cartesian_columns():
+    rows = []
+    for i in range(12):
+        range_m = 10.0 + i * 0.05
+        major_m = 0.2 + i * 0.03
+        minor_m = -0.1 + i * 0.02
+        rows.append(_make_row(i, range_m, major_m, minor_m, ts_compensated_db=-35.0))
+    df = pd.DataFrame(rows)
+
+    result = assign_tracks(df, TRACKER_PARAM_DEFAULTS)
+
+    for col in ("major_axis_m", "minor_axis_m", "range_axis_m"):
+        assert col in result.columns
+        assert result[col].notna().all()

@@ -13,8 +13,11 @@ attitude -- please read this twice, it is easy to flip):
     minor_axis_m -> derived from ALONGSHIP angle  (ESP3's "minor axis" / X)
     range_axis_m -> range_m unchanged
 
-This module only forms tracks. It does not compute equivalent size-from-TS,
-UTM position, or speed -- that is a separate follow-up step.
+This module forms tracks (`assign_tracks`) and summarizes per-track
+statistics (`summarize_tracks`), including speed through the local Cartesian
+frame and an optional TS-derived equivalent length. It does not compute UTM
+position -- there is no GPS in this deployment yet, that is a separate
+follow-up step out of scope here.
 """
 
 from __future__ import annotations
@@ -124,7 +127,15 @@ def assign_tracks(detections_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     per-axis alpha-beta filter with gated, cost-weighted association.
 
     Returns a copy of `detections_df` with an added integer `track_id`
-    column. Detections not part of an accepted track are given
+    column, plus the `major_axis_m` / `minor_axis_m` / `range_axis_m` local
+    Cartesian columns computed internally by `_angles_to_local_cartesian`
+    (see its docstring for the axis convention). These are attached to every
+    row (including unassigned ones), not just accepted tracks, since they
+    are a straightforward per-detection geometric quantity independent of
+    track acceptance; downstream code (e.g. `summarize_tracks`) uses them
+    directly rather than recomputing the angle-to-Cartesian conversion.
+
+    Detections not part of an accepted track are given
     `track_id = UNASSIGNED_TRACK_ID` (-1), not NaN, so the column stays a
     plain integer dtype (there is no missing-detection case to distinguish
     from "definitely not tracked").
@@ -149,6 +160,9 @@ def assign_tracks(detections_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if len(detections_df) == 0:
         result = detections_df.copy()
         result["track_id"] = pd.Series(dtype="int64")
+        result["major_axis_m"] = pd.Series(dtype="float64")
+        result["minor_axis_m"] = pd.Series(dtype="float64")
+        result["range_axis_m"] = pd.Series(dtype="float64")
         return result
 
     df = _angles_to_local_cartesian(detections_df)
@@ -293,31 +307,97 @@ def assign_tracks(detections_df: pd.DataFrame, params: dict) -> pd.DataFrame:
     df = df.sort_values("_original_row", kind="stable")
     result = detections_df.copy()
     result["track_id"] = df["track_id"].to_numpy()
+    # Also expose the local Cartesian frame used internally for tracking --
+    # this is generally useful output (e.g. for speed-through-track
+    # computations downstream in summarize_tracks), not just an
+    # implementation detail, so we attach it here rather than making callers
+    # recompute _angles_to_local_cartesian themselves.
+    result["major_axis_m"] = df["major_axis_m"].to_numpy()
+    result["minor_axis_m"] = df["minor_axis_m"].to_numpy()
+    result["range_axis_m"] = df["range_axis_m"].to_numpy()
     return result
 
 
-def summarize_tracks(tracked_df: pd.DataFrame) -> pd.DataFrame:
+def _track_mean_speed_m_per_s(track_rows: pd.DataFrame) -> float:
+    """
+    Average speed magnitude of a single track through the local Cartesian
+    frame (`major_axis_m`, `minor_axis_m`, `range_axis_m`), using actual
+    elapsed wall-clock time between consecutive detections (`ping_time`)
+    rather than ping-count, since ping cadence may not be perfectly uniform.
+
+    `track_rows` must already be sorted by ping order. A step is skipped
+    (rather than raising) if its time delta is zero -- this should not
+    happen in practice (two detections of the same track at the identical
+    timestamp), but we guard against a division by zero regardless. Returns
+    NaN if there are fewer than two detections, or if every step was
+    skipped, since no speed estimate is possible.
+    """
+    positions = track_rows[["major_axis_m", "minor_axis_m", "range_axis_m"]].to_numpy(dtype=float)
+    times = track_rows["ping_time"].to_numpy()
+
+    if len(positions) < 2:
+        return float("nan")
+
+    step_speeds: List[float] = []
+    for i in range(len(positions) - 1):
+        dt = (times[i + 1] - times[i]) / np.timedelta64(1, "s")
+        if dt <= 0:
+            continue
+        displacement = np.linalg.norm(positions[i + 1] - positions[i])
+        step_speeds.append(displacement / dt)
+
+    if not step_speeds:
+        return float("nan")
+    return float(np.mean(step_speeds))
+
+
+def summarize_tracks(
+    tracked_df: pd.DataFrame,
+    ts_length_a: Optional[float] = None,
+    ts_length_b: Optional[float] = None,
+) -> pd.DataFrame:
     """
     Build one summary row per accepted track_id (unassigned detections,
     track_id == UNASSIGNED_TRACK_ID, are excluded).
 
-    Does not compute equivalent size-from-TS, UTM position, or speed -- that
-    is a separate follow-up step, out of scope here.
+    `tracked_df` must be the output of `assign_tracks` (or otherwise carry
+    its `major_axis_m` / `minor_axis_m` / `range_axis_m` columns), since
+    `speed_m_per_s_mean` is computed from them directly rather than
+    recomputing the angle-to-Cartesian conversion here.
+
+    `ts_length_a` / `ts_length_b` are optional coefficients of the standard
+    fisheries-acoustics regression `TS = a*log10(length_cm) + b`; if both
+    are provided, an `equivalent_length_cm` column is added per track by
+    inverting that regression against `ts_compensated_db_mean`:
+    `10 ** ((ts_compensated_db_mean - b) / a)`. If either is None (the
+    default), the column is omitted entirely -- this constant is
+    species-specific and not yet available for this deployment's target
+    species, so it is a pass-through for the caller to supply later, not
+    something to compute or default here.
+
+    Does not compute UTM position -- there is no GPS in this deployment yet,
+    that is a separate follow-up step, out of scope here.
     """
+    base_columns = [
+        "track_id",
+        "n_detections",
+        "n_pings",
+        "first_ping_index",
+        "last_ping_index",
+        "ts_compensated_db_mean",
+        "ts_compensated_db_min",
+        "ts_compensated_db_max",
+        "range_m_mean",
+        "range_m_min",
+        "range_m_max",
+        "speed_m_per_s_mean",
+    ]
+    if ts_length_a is not None and ts_length_b is not None:
+        base_columns.append("equivalent_length_cm")
+
     accepted = tracked_df[tracked_df["track_id"] != UNASSIGNED_TRACK_ID]
     if len(accepted) == 0:
-        return pd.DataFrame(
-            columns=[
-                "track_id",
-                "n_detections",
-                "n_pings",
-                "first_ping_index",
-                "last_ping_index",
-                "ts_compensated_db_mean",
-                "ts_compensated_db_min",
-                "ts_compensated_db_max",
-            ]
-        )
+        return pd.DataFrame(columns=base_columns)
 
     grouped = accepted.groupby("track_id")
     summary = grouped.agg(
@@ -328,6 +408,20 @@ def summarize_tracks(tracked_df: pd.DataFrame) -> pd.DataFrame:
         ts_compensated_db_mean=("ts_compensated_db", "mean"),
         ts_compensated_db_min=("ts_compensated_db", "min"),
         ts_compensated_db_max=("ts_compensated_db", "max"),
+        range_m_mean=("range_m", "mean"),
+        range_m_min=("range_m", "min"),
+        range_m_max=("range_m", "max"),
     ).reset_index()
 
-    return summary.sort_values("track_id").reset_index(drop=True)
+    speed_by_track = {}
+    for track_id, track_rows in accepted.groupby("track_id"):
+        track_rows = track_rows.sort_values("ping_index", kind="stable")
+        speed_by_track[track_id] = _track_mean_speed_m_per_s(track_rows)
+    summary["speed_m_per_s_mean"] = summary["track_id"].map(speed_by_track)
+
+    if ts_length_a is not None and ts_length_b is not None:
+        summary["equivalent_length_cm"] = 10 ** (
+            (summary["ts_compensated_db_mean"] - ts_length_b) / ts_length_a
+        )
+
+    return summary.sort_values("track_id").reset_index(drop=True)[base_columns]
