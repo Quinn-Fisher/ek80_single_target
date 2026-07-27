@@ -6,8 +6,9 @@ It provides:
 - EK80 loading via `echopype`
 - calibrated `Sv` and `TS` products
 - single-target detection with stage-by-stage diagnostics
-- side-by-side `Sv` and `TS` echograms with detection overlays
-- target table export and calibration verification script
+- ESP3-style alpha-beta track formation over detections, with an additional range-coherence acceptance heuristic tuned for bubble/clutter-noisy deployments
+- side-by-side `Sv` and `TS` echograms with detection and track overlays
+- target table and track table export, and a calibration verification script
 
 ---
 
@@ -19,10 +20,14 @@ single_target/
 ├── detection/
 │   ├── loader.py
 │   ├── algorithm.py
+│   ├── tracker.py
 │   └── compensation.py
 ├── viz/
 │   ├── echogram.py
 │   └── histogram.py
+├── tests/
+│   ├── test_tracker.py
+│   └── test_echogram.py
 ├── verify_calibration.py
 └── README.md
 ```
@@ -40,6 +45,13 @@ Install:
 pip install -r requirements.txt
 ```
 
+For running the test suite (`tests/`), also install `requirements-dev.txt` (adds `pytest`):
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
 ---
 
 ## Run the App
@@ -53,12 +65,14 @@ streamlit run app.py
 Workflow:
 1. Upload EK80 `.raw`
 2. Select split-beam channel
-3. Set parameters
+3. Set detection parameters
 4. Click **Run Detection**
-5. Review:
-   - **Echogram** tab (Sv panel + TS panel)
+5. Set tracking parameters, click **Run Tracking** (operates on the current detections; re-run it after tweaking tracker parameters without needing to re-run detection)
+6. Review:
+   - **Echogram** tab (Sv panel + TS panel; detections are colored/connected by track once tracking has been run, otherwise shown as plain markers)
    - **TS Distribution**
    - **Detection Table**
+   - **Tracks** tab (per-track summary + CSV export)
 
 Notes:
 - Upload only loads data/metadata; detection runs only on button click.
@@ -331,6 +345,90 @@ Accounting identity:
 
 ---
 
+## Track Formation (`detection/tracker.py`)
+
+Turns per-ping single-target detections into fish tracks. Implemented in
+`assign_tracks()` / `summarize_tracks()`, mirroring NIWA's ESP3
+(`track_targets_angular.m`) angular alpha-beta tracker, adapted for a
+stationary shore-based deployment with no vessel attitude data (no
+heave/pitch/roll/yaw correction — the `IgnoreAttitude=true` path in ESP3).
+There is no UTM/GPS position available in this deployment yet, so tracking
+happens entirely in a local range/angle-derived Cartesian frame
+(`major_axis_m`/`minor_axis_m`/`range_axis_m`, attached to `assign_tracks()`'s
+output), not real-world coordinates.
+
+### Algorithm
+
+Per-axis (major/minor/range) alpha-beta filter with a constant-velocity
+motion model:
+- **Predict** a track's position at the next ping from its last smoothed
+  position and velocity, extrapolated by the actual ping-index gap.
+- **Gate** candidate detections against an ellipsoid around the predicted
+  position; the gate widens with range (wider angular uncertainty at longer
+  range) and with the size of the ping gap being bridged (missed-ping
+  expansion), so a track can survive a few consecutive pings with no
+  detection.
+- **Assign** via a weighted cost (not nearest-distance) combining
+  normalized gate distance per axis, TS similarity to the track's last
+  detection, and the ping gap — resolved with a greedy global assignment
+  per ping (lowest cost first, each track and candidate used at most once).
+  This is a documented simplification of ESP3's own conflict-resolution
+  logic, not a literal transliteration.
+- **Update** matched tracks' smoothed position/velocity; unclaimed
+  detections start new singleton tracks.
+
+### Track acceptance
+
+A track is only accepted (assigned a real `track_id`; otherwise its
+detections get `track_id = -1`, see `UNASSIGNED_TRACK_ID`) if it passes
+**all** of:
+- `n_detections >= min_st_track`
+- ping span `>= min_pings_track` (or `>= min_pings_track_near` if the
+  track's minimum range is within `near_range_track_m` — better SNR at
+  close range justifies accepting a shorter track)
+- range coherence: `max(range_m) - min(range_m) <= max_range_deviation_m`
+  across the track's detections
+
+The range-coherence gate and the specific `min_pings_track`/
+`min_st_track`/`near_range_track_m`/`min_pings_track_near` defaults come
+from Scott's own empirically-derived heuristic for bubble/clutter-noisy
+data (side-looking EK80 WBT, heavy air-bubble interference), not from
+ESP3's generic defaults:
+
+> "I have tried to isolate only those tracks that were greater than
+> 4-pings long (or 3-pings < 10m range) and deviated in range < 12 cm."
+
+This supersedes ESP3's own generic `min_pings_track=10`/`min_st_track=8`
+defaults for this kind of noisy deployment — see `TRACKER_PARAM_DEFAULTS`
+in `detection/tracker.py` for the full parameter set and inline comments
+on provenance (ESP3-derived vs. Scott-derived) for each one. All tracker
+parameters are exposed in the app's "Tracking Parameters" sidebar section
+(core tunables) and an "Advanced tracker parameters" expander (alpha/beta
+gains, gate weights, missed-ping expansion).
+
+**Known physical limitation, not a tunable bug:** if a bubble sits in the
+same range cell as a fish (same pulse volume), it inflates that echo's TS
+rather than producing a separate rejectable detection — this shows up as
+TS trending stronger with range in noisy data. Track-level TS/size
+statistics should be treated with more caution at longer range until this
+is characterized further.
+
+### Track-level stats (`summarize_tracks()`)
+
+One row per accepted track: `n_detections`, `n_pings`, `first_ping_index`,
+`last_ping_index`, `ts_compensated_db_mean/min/max`, `range_m_mean/min/max`,
+`range_deviation_m`, `speed_m_per_s_mean` (real elapsed time from
+`ping_time`, not ping count). `equivalent_length_cm` is computed only if
+optional `ts_length_a`/`ts_length_b` coefficients (a published or measured
+species-specific `TS = a*log10(length_cm) + b` regression) are supplied —
+there is no default for these, and the app's UI leaves the corresponding
+fields blank/unused unless explicitly enabled, since guessing a species
+constant would be worse than omitting the column. UTM/real-world position
+is not computed — blocked on GPS logging, which is not yet available in
+this deployment's data.
+
+---
+
 ## Visualization
 
 ### Echogram (`viz/echogram.py`)
@@ -341,6 +439,12 @@ Echogram tab now shows both:
 
 Both support:
 - overlay of accepted detections
+- once tracking has been run, detections are colored and connected by
+  `track_id` (one line+marker trace per accepted track, cycling a
+  high-contrast qualitative palette keyed by `track_id`, so colors are
+  stable across re-renders); unassigned detections still render as plain
+  markers. Falls back to the original plain-marker rendering when no
+  `track_id` column is present.
 - physical range axis from `echo_range` (1D or median profile for 2D range grids)
 
 ### Histogram (`viz/histogram.py`)
