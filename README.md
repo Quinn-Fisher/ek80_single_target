@@ -90,7 +90,7 @@ This follows TS equation gain sign (`-2*G`).
 - `Max gain comp (dB)`: cap on beam compensation
 - `Min pulse width`: lower bound on normalized pulse width
 - `Max pulse width`: upper bound on normalized pulse width
-- `Phase std max (deg)`: gate on phase-derived mechanical angle std (default `0.237`)
+- `Phase std max (deg)`: gate on phase-derived mechanical angle std (default `0.537`)
 - Optional temporary depth gate:
   - `Min analysis range (m)`
   - `Max analysis range (m)`

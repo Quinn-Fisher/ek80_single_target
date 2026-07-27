@@ -103,7 +103,7 @@ def detect_single_targets(
     Run Soule 1997 phase-based single target discrimination.
 
     Notes:
-    - `phase_std_max_deg` default 0.237 is one electrical phase step converted
+    - `phase_std_max_deg` default 0.537 is one electrical phase step converted
       to mechanical degrees for ES38-18 style split-beam geometry.
     """
     beam = data["beam"]

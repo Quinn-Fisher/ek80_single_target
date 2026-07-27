@@ -163,10 +163,10 @@ with st.sidebar:
             "Phase std max (deg)",
             min_value=0.1,
             max_value=5.0,
-            value=0.237,
+            value=0.537,
             step=0.001,
             format="%.3f",
-            help="0.237 deg corresponds to 1 electrical phase step mapped to mechanical angle for ES38-18 geometry.",
+            help="0.537 deg corresponds to 1 electrical phase step mapped to mechanical angle for ES38-18 geometry.",
         )
         st.markdown("── Temporary Depth Gate (diagnostic) ──")
         enable_depth_gate = st.checkbox(
@@ -278,6 +278,7 @@ with st.sidebar:
         n_range = int(beam["range_sample"].size)
         st.markdown("── File Info ──")
         st.text(f"Channel:      {ch}")
+        st.text(f"Waveform:     {view_data.get('waveform_mode', 'CW')}")
         st.text(f"Frequency:    {freq_hz / 1000:.0f} kHz")
         st.text(f"Pulse dur:    {view_data['pulse_duration_s'] * 1e3:.3f} ms")
         if st.session_state.diagnostics is not None:
