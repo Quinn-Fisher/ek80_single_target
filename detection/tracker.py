@@ -55,9 +55,49 @@ TRACKER_PARAM_DEFAULTS: Dict[str, float] = {
     "weight_ping_gap": 5.0,
     "delta_ts_max_db": 30.0,
     # Track acceptance / gap tolerance.
-    "min_st_track": 8,
-    "min_pings_track": 10,
+    #
+    # min_st_track / min_pings_track: ESP3's generic defaults were 8 / 10.
+    # Both have since been overridden below with values empirically derived
+    # by Scott (the client's hydroacoustics contractor) from hand-labeled
+    # analysis of stationary side-looking EK80 WBT data in a heavy
+    # air-bubble-noise environment: "I have tried to isolate only those
+    # tracks that were greater than 4-pings long (or 3-pings < 10m range)
+    # and deviated in range < 12 cm." That quote is the source of
+    # min_pings_track=4 here, and of min_pings_track_near / near_range_track_m
+    # / max_range_deviation_m below. If a future reader finds ESP3's 8/10
+    # cited elsewhere in project history, that is not a bug -- it is the
+    # prior generic default, superseded here for this noise environment by
+    # someone who actually looked at labeled real data.
+    #
+    # min_st_track is set equal to min_pings_track (4, not ESP3's 8) because
+    # detection-level within-ping dedup happens upstream of tracking, so in
+    # practice a track's detection count and its ping count are normally the
+    # same number (at most one detection per ping survives dedup). Requiring
+    # 8 detections while only requiring a 4-ping span would make the
+    # ping-span criterion moot -- a track could satisfy min_pings_track at 4
+    # pings but still be rejected on detection count alone, silently
+    # re-imposing something close to the old 8/10 pair through the back
+    # door. Aligning the two numbers keeps the ping-span gate meaningful.
+    "min_st_track": 4,
+    "min_pings_track": 4,
     "max_gap_track": 5,
+    # Range-deviation acceptance gate (Scott's "deviated in range < 12 cm"):
+    # a track is rejected unless max(range_m) - min(range_m) across all its
+    # detections is <= this value. Deliberately computed from the raw
+    # range_m column, not the local Cartesian range_axis_m -- range_m is the
+    # physically interpretable quantity Scott is describing (a straight
+    # along-beam range reading), whereas range_axis_m is an internal
+    # tracking-frame convenience copy of the same numbers (see
+    # _angles_to_local_cartesian) that happens to be numerically identical
+    # here but is conceptually the wrong column to say "matches Scott's
+    # heuristic" against.
+    "max_range_deviation_m": 0.12,
+    # Range-conditional minimum ping-span relaxation (Scott's "3-pings <
+    # 10m range"): tracks whose range is within near_range_track_m may pass
+    # acceptance with only min_pings_track_near pings instead of the full
+    # min_pings_track.
+    "near_range_track_m": 10.0,
+    "min_pings_track_near": 3,
 }
 
 # Value used in the output `track_id` column for detections that are not
@@ -283,10 +323,15 @@ def assign_tracks(detections_df: pd.DataFrame, params: dict) -> pd.DataFrame:
 
     finished_tracks.extend(active_tracks)
 
-    # Track acceptance: keep only tracks with enough detections and enough
-    # ping span; discard the rest (their detections become unassigned).
+    # Track acceptance: keep only tracks with enough detections, enough ping
+    # span, and range coherence; discard the rest (their detections become
+    # unassigned). See Scott's heuristic quoted above TRACKER_PARAM_DEFAULTS.
     min_st_track = int(p["min_st_track"])
     min_pings_track = int(p["min_pings_track"])
+    min_pings_track_near = int(p["min_pings_track_near"])
+    near_range_track_m = float(p["near_range_track_m"])
+    max_range_deviation_m = float(p["max_range_deviation_m"])
+    range_m_arr = df["range_m"].to_numpy(dtype=float)
 
     accepted_row_track_id = np.full(len(df), UNASSIGNED_TRACK_ID, dtype=int)
     accepted_id_counter = 0
@@ -295,7 +340,28 @@ def assign_tracks(detections_df: pd.DataFrame, params: dict) -> pd.DataFrame:
         first_ping = df["ping_index"].to_numpy()[tr.row_indices].min()
         last_ping = df["ping_index"].to_numpy()[tr.row_indices].max()
         ping_span = int(last_ping - first_ping + 1)
-        if n_detections >= min_st_track and ping_span >= min_pings_track:
+
+        track_range_m = range_m_arr[tr.row_indices]
+        # "How close does this track get" is judged by its minimum range_m,
+        # not its mean -- Scott's relaxation ("3-pings < 10m range") reads as
+        # being about whether the target ever comes within the near-range
+        # threshold (better SNR at close range), not about its average
+        # range over the whole track. A track that starts far and swims
+        # into 8m range should get the same benefit of the doubt as one
+        # that stayed at 8m throughout; using the mean would penalize a
+        # track for time spent farther away even though the close approach
+        # is what gives us confidence in its detections.
+        track_min_range_m = float(track_range_m.min())
+        applicable_min_pings = (
+            min_pings_track_near if track_min_range_m < near_range_track_m else min_pings_track
+        )
+        range_deviation_m = float(track_range_m.max() - track_range_m.min())
+
+        if (
+            n_detections >= min_st_track
+            and ping_span >= applicable_min_pings
+            and range_deviation_m <= max_range_deviation_m
+        ):
             for row in tr.row_indices:
                 accepted_row_track_id[row] = accepted_id_counter
             accepted_id_counter += 1
@@ -390,6 +456,7 @@ def summarize_tracks(
         "range_m_mean",
         "range_m_min",
         "range_m_max",
+        "range_deviation_m",
         "speed_m_per_s_mean",
     ]
     if ts_length_a is not None and ts_length_b is not None:
@@ -412,6 +479,10 @@ def summarize_tracks(
         range_m_min=("range_m", "min"),
         range_m_max=("range_m", "max"),
     ).reset_index()
+    # Same max-min quantity used for the tracker's range-deviation
+    # acceptance gate (see max_range_deviation_m), surfaced per-track here
+    # since it is directly relevant to interpreting result quality.
+    summary["range_deviation_m"] = summary["range_m_max"] - summary["range_m_min"]
 
     speed_by_track = {}
     for track_id, track_rows in accepted.groupby("track_id"):

@@ -229,6 +229,45 @@ with st.sidebar:
             step=1,
             help="A candidate track is discarded unless it spans at least this many pings (last_ping - first_ping + 1).",
         )
+        max_range_deviation_m = st.number_input(
+            "Max range deviation (m)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(TRACKER_PARAM_DEFAULTS["max_range_deviation_m"]),
+            step=0.01,
+            format="%.2f",
+            help=(
+                "A candidate track is discarded unless max(range) - min(range) across its "
+                "detections is within this bound. Empirically derived by the client's "
+                "hydroacoustics contractor (Scott) from hand-labeled EK80 data in a "
+                "heavy air-bubble-noise environment: real fish stay range-coherent over a "
+                "few pings, whereas bubble/noise tracks tend to wander in range."
+            ),
+        )
+        near_range_track_m = st.number_input(
+            "Near-range threshold (m)",
+            min_value=0.0,
+            max_value=1000.0,
+            value=float(TRACKER_PARAM_DEFAULTS["near_range_track_m"]),
+            step=1.0,
+            help=(
+                "Below this range, the relaxed 'Min ping span (near range)' threshold "
+                "applies instead of 'Min ping span per track' -- closer targets have "
+                "better SNR/more reliable detections per ping, so a shorter run is still "
+                "trustworthy. Part of Scott's empirically-derived bubble-noise heuristic."
+            ),
+        )
+        min_pings_track_near = st.number_input(
+            "Min ping span (near range)",
+            min_value=1,
+            max_value=1000,
+            value=int(TRACKER_PARAM_DEFAULTS["min_pings_track_near"]),
+            step=1,
+            help=(
+                "Relaxed minimum ping span applied to tracks whose range gets within "
+                "'Near-range threshold' -- from Scott's heuristic: '3-pings < 10m range'."
+            ),
+        )
         max_gap_track = st.number_input(
             "Max ping gap",
             min_value=1,
@@ -432,6 +471,9 @@ if run_tracking:
             "excl_dist_range_m": float(excl_dist_range_m),
             "min_st_track": int(min_st_track),
             "min_pings_track": int(min_pings_track),
+            "max_range_deviation_m": float(max_range_deviation_m),
+            "near_range_track_m": float(near_range_track_m),
+            "min_pings_track_near": int(min_pings_track_near),
             "max_gap_track": int(max_gap_track),
             "alpha_major": float(alpha_major),
             "alpha_minor": float(alpha_minor),

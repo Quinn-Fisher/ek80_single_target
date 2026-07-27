@@ -62,8 +62,13 @@ def _tracked_track_ids(tracked_df: pd.DataFrame) -> set:
 def test_single_smooth_track_forms_one_accepted_track():
     rows = []
     n_pings = 18
+    # range_m deliberately drifts by only ~0.085m total (17 steps * 0.005m)
+    # over the whole track -- comfortably inside max_range_deviation_m
+    # (0.12m) -- so this fixture continues to test smooth single-track
+    # *formation* across many pings, not the (separately tested) range-
+    # deviation acceptance gate.
     for i in range(n_pings):
-        range_m = 10.0 + i * 0.05
+        range_m = 10.0 + i * 0.005
         major_m = 0.2 + i * 0.03
         minor_m = -0.1 + i * 0.02
         rows.append(_make_row(i, range_m, major_m, minor_m, ts_compensated_db=-35.0))
@@ -164,6 +169,79 @@ def test_scattered_noise_detections_are_unassigned():
     assert (result["track_id"] == UNASSIGNED_TRACK_ID).all()
 
 
+def test_range_deviation_gate_rejects_wandering_track():
+    # Same "smooth track" shape (major/minor axes) as the passing fixture
+    # above -- enough pings/detections to satisfy min_st_track /
+    # min_pings_track on their own -- but range_m now oscillates by 0.3m
+    # (well under the alpha-beta range gate's excl_dist_range_m=2.0m, so it
+    # still forms a single track, but well over max_range_deviation_m=0.12m),
+    # so the new range-deviation acceptance gate should reject it even
+    # though it previously would have passed.
+    rows = []
+    n_pings = 18
+    for i in range(n_pings):
+        range_m = 10.0 + (0.3 if i % 2 == 0 else 0.0)
+        major_m = 0.2 + i * 0.03
+        minor_m = -0.1 + i * 0.02
+        rows.append(_make_row(i, range_m, major_m, minor_m, ts_compensated_db=-35.0))
+    df = pd.DataFrame(rows)
+
+    result = assign_tracks(df, TRACKER_PARAM_DEFAULTS)
+
+    assert (result["track_id"] == UNASSIGNED_TRACK_ID).all(), (
+        "track's range wanders by 0.3m > max_range_deviation_m=0.12m; should be rejected"
+    )
+
+
+def test_near_range_relaxation_accepts_short_close_track():
+    # Only 3 pings/3 detections, all within near_range_track_m (range ~5m)
+    # and within the range-deviation gate. min_st_track is overridden to 3
+    # here to isolate the ping-span relaxation logic (the default
+    # min_st_track=4 would otherwise reject any 3-detection track on
+    # detection count alone, before the ping-span/range-conditional logic
+    # even gets exercised). Under the *old* ESP3-derived min_pings_track=10
+    # default this 3-ping track would have been rejected outright; under
+    # the new near-range relaxation (min_pings_track_near=3 when
+    # range < near_range_track_m=10.0) it should be accepted.
+    params = {**TRACKER_PARAM_DEFAULTS, "min_st_track": 3}
+    rows = []
+    for i in range(3):
+        range_m = 5.0 + i * 0.02
+        major_m = 0.0
+        minor_m = 0.1 * i
+        rows.append(_make_row(i, range_m, major_m, minor_m, ts_compensated_db=-35.0))
+    df = pd.DataFrame(rows)
+
+    result = assign_tracks(df, params)
+
+    assert len(_tracked_track_ids(result)) == 1
+    assert (result["track_id"] != UNASSIGNED_TRACK_ID).all()
+
+
+def test_near_range_relaxation_does_not_apply_far_from_sensor():
+    # Identical shape to the test above (3 pings, min_st_track relaxed to 3,
+    # within the range-deviation gate) but range is ~50m, well outside
+    # near_range_track_m=10.0. The relaxed 3-ping threshold must not apply
+    # here -- the full min_pings_track=4 still governs, so this 3-ping track
+    # should be rejected, proving the relaxation is range-conditional and
+    # not universal.
+    params = {**TRACKER_PARAM_DEFAULTS, "min_st_track": 3}
+    rows = []
+    for i in range(3):
+        range_m = 50.0 + i * 0.02
+        major_m = 0.0
+        minor_m = 0.1 * i
+        rows.append(_make_row(i, range_m, major_m, minor_m, ts_compensated_db=-35.0))
+    df = pd.DataFrame(rows)
+
+    result = assign_tracks(df, params)
+
+    assert (result["track_id"] == UNASSIGNED_TRACK_ID).all(), (
+        "3-ping track far from sensor should still be rejected -- near-range "
+        "relaxation must not apply universally"
+    )
+
+
 def _base_time(ping_index: int) -> pd.Timestamp:
     return pd.Timestamp("2026-01-01") + pd.Timedelta(seconds=ping_index * 0.1)
 
@@ -201,6 +279,7 @@ def test_summarize_tracks_aggregates_correctly():
     assert row0["range_m_mean"] == pytest.approx((10.0 + 12.0 + 11.0) / 3.0)
     assert row0["range_m_min"] == pytest.approx(10.0)
     assert row0["range_m_max"] == pytest.approx(12.0)
+    assert row0["range_deviation_m"] == pytest.approx(12.0 - 10.0)
 
     row1 = summary[summary["track_id"] == 1].iloc[0]
     assert row1["n_detections"] == 4
@@ -213,6 +292,7 @@ def test_summarize_tracks_aggregates_correctly():
     assert row1["range_m_mean"] == pytest.approx((30.0 + 33.0 + 28.0 + 31.0) / 4.0)
     assert row1["range_m_min"] == pytest.approx(28.0)
     assert row1["range_m_max"] == pytest.approx(33.0)
+    assert row1["range_deviation_m"] == pytest.approx(33.0 - 28.0)
 
 
 def test_summarize_tracks_excludes_unassigned():
