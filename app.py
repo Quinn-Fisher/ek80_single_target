@@ -522,7 +522,12 @@ with tab1:
         st.info("Upload a .raw file to view echogram and detections.")
     else:
         ch_plot = st.session_state.selected_channel or data["ch_splitbeam"]
-        detections_for_plot = st.session_state.detections_df if st.session_state.detections_df is not None else pd.DataFrame()
+        if st.session_state.tracked_df is not None and not st.session_state.tracked_df.empty:
+            detections_for_plot = st.session_state.tracked_df
+        elif st.session_state.detections_df is not None:
+            detections_for_plot = st.session_state.detections_df
+        else:
+            detections_for_plot = pd.DataFrame()
 
         fig_sv = plot_echogram(
             data["ds_Sv"],
@@ -545,10 +550,17 @@ with tab1:
         else:
             st.info("TS echogram unavailable for this file load.")
 
-        st.info(
-            "Top panel: Sv echogram. Bottom panel: TS echogram. "
-            "White circles indicate accepted single-target detections."
-        )
+        if st.session_state.tracked_df is not None and not st.session_state.tracked_df.empty:
+            st.info(
+                "Top panel: Sv echogram. Bottom panel: TS echogram. "
+                "Colored connected paths indicate accepted tracks; white circles are "
+                "unassigned/untracked detections."
+            )
+        else:
+            st.info(
+                "Top panel: Sv echogram. Bottom panel: TS echogram. "
+                "White circles indicate accepted single-target detections."
+            )
 
 with tab2:
     df = st.session_state.detections_df
