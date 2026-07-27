@@ -12,6 +12,7 @@ import streamlit as st
 
 from detection.algorithm import detect_single_targets
 from detection.loader import build_channel_data, load_raw_file
+from detection.tracker import TRACKER_PARAM_DEFAULTS, assign_tracks, summarize_tracks
 from viz.echogram import plot_echogram
 from viz.histogram import plot_ts_histogram
 
@@ -67,6 +68,10 @@ if "results_channel" not in st.session_state:
     st.session_state.results_channel = None
 if "loaded_file_signature" not in st.session_state:
     st.session_state.loaded_file_signature = None
+if "tracked_df" not in st.session_state:
+    st.session_state.tracked_df = None
+if "track_summary_df" not in st.session_state:
+    st.session_state.track_summary_df = None
 
 with st.sidebar:
     uploaded_file = st.file_uploader("Upload EK80 raw file", type=["raw"])
@@ -87,6 +92,8 @@ if uploaded_file is not None:
             st.session_state.diagnostics = None
             st.session_state.last_params = None
             st.session_state.results_channel = None
+            st.session_state.tracked_df = None
+            st.session_state.track_summary_df = None
             split_options = data.get("ch_splitbeam_all", [data["ch_splitbeam"]])
             st.session_state.selected_channel = split_options[0] if split_options else None
             st.success(f"Loaded: {uploaded_file.name}")
@@ -114,6 +121,8 @@ with st.sidebar:
             ):
                 st.session_state.detections_df = None
                 st.session_state.diagnostics = None
+                st.session_state.tracked_df = None
+                st.session_state.track_summary_df = None
 
     st.subheader("Calibration")
     gain_offset_db = st.number_input(
@@ -178,6 +187,172 @@ with st.sidebar:
         max_range_m = st.number_input("Max analysis range (m)", min_value=1.0, value=500.0, step=1.0)
         run_detection = st.form_submit_button("Run Detection", type="primary")
 
+    st.markdown("── Tracking Parameters ──")
+    with st.form("tracking_form"):
+        excl_dist_major_m = st.number_input(
+            "Exclusion dist, major axis (m)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(TRACKER_PARAM_DEFAULTS["excl_dist_major_m"]),
+            step=0.5,
+            help="Minimum gate half-width along the athwartship-derived major axis, before angular widening.",
+        )
+        excl_dist_minor_m = st.number_input(
+            "Exclusion dist, minor axis (m)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(TRACKER_PARAM_DEFAULTS["excl_dist_minor_m"]),
+            step=0.5,
+            help="Minimum gate half-width along the alongship-derived minor axis, before angular widening.",
+        )
+        excl_dist_range_m = st.number_input(
+            "Exclusion dist, range axis (m)",
+            min_value=0.0,
+            max_value=50.0,
+            value=float(TRACKER_PARAM_DEFAULTS["excl_dist_range_m"]),
+            step=0.5,
+            help="Gate half-width along the range axis.",
+        )
+        min_st_track = st.number_input(
+            "Min detections per track",
+            min_value=1,
+            max_value=1000,
+            value=int(TRACKER_PARAM_DEFAULTS["min_st_track"]),
+            step=1,
+            help="A candidate track is discarded unless it contains at least this many detections.",
+        )
+        min_pings_track = st.number_input(
+            "Min ping span per track",
+            min_value=1,
+            max_value=1000,
+            value=int(TRACKER_PARAM_DEFAULTS["min_pings_track"]),
+            step=1,
+            help="A candidate track is discarded unless it spans at least this many pings (last_ping - first_ping + 1).",
+        )
+        max_gap_track = st.number_input(
+            "Max ping gap",
+            min_value=1,
+            max_value=100,
+            value=int(TRACKER_PARAM_DEFAULTS["max_gap_track"]),
+            step=1,
+            help="Maximum number of consecutive missed pings before a track can no longer be extended.",
+        )
+
+        with st.expander("Advanced tracker parameters"):
+            st.markdown("Alpha-beta filter gains")
+            alpha_major = st.number_input(
+                "alpha_major", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["alpha_major"]), step=0.05
+            )
+            alpha_minor = st.number_input(
+                "alpha_minor", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["alpha_minor"]), step=0.05
+            )
+            alpha_range = st.number_input(
+                "alpha_range", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["alpha_range"]), step=0.05
+            )
+            beta_major = st.number_input(
+                "beta_major", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["beta_major"]), step=0.05
+            )
+            beta_minor = st.number_input(
+                "beta_minor", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["beta_minor"]), step=0.05
+            )
+            beta_range = st.number_input(
+                "beta_range", min_value=0.0, max_value=1.0, value=float(TRACKER_PARAM_DEFAULTS["beta_range"]), step=0.05
+            )
+
+            st.markdown("Angular gate widening")
+            max_std_major_deg = st.number_input(
+                "max_std_major_deg",
+                min_value=0.0,
+                max_value=30.0,
+                value=float(TRACKER_PARAM_DEFAULTS["max_std_major_deg"]),
+                step=0.1,
+            )
+            max_std_minor_deg = st.number_input(
+                "max_std_minor_deg",
+                min_value=0.0,
+                max_value=30.0,
+                value=float(TRACKER_PARAM_DEFAULTS["max_std_minor_deg"]),
+                step=0.1,
+            )
+
+            st.markdown("Missed-ping gate expansion (% per ping of gap)")
+            missed_ping_exp_major_pct = st.number_input(
+                "missed_ping_exp_major_pct",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(TRACKER_PARAM_DEFAULTS["missed_ping_exp_major_pct"]),
+                step=1.0,
+            )
+            missed_ping_exp_minor_pct = st.number_input(
+                "missed_ping_exp_minor_pct",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(TRACKER_PARAM_DEFAULTS["missed_ping_exp_minor_pct"]),
+                step=1.0,
+            )
+            missed_ping_exp_range_pct = st.number_input(
+                "missed_ping_exp_range_pct",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(TRACKER_PARAM_DEFAULTS["missed_ping_exp_range_pct"]),
+                step=1.0,
+            )
+
+            st.markdown("Assignment cost weights")
+            weight_major = st.number_input(
+                "weight_major", min_value=0.0, max_value=1000.0, value=float(TRACKER_PARAM_DEFAULTS["weight_major"]), step=1.0
+            )
+            weight_minor = st.number_input(
+                "weight_minor", min_value=0.0, max_value=1000.0, value=float(TRACKER_PARAM_DEFAULTS["weight_minor"]), step=1.0
+            )
+            weight_range = st.number_input(
+                "weight_range", min_value=0.0, max_value=1000.0, value=float(TRACKER_PARAM_DEFAULTS["weight_range"]), step=1.0
+            )
+            weight_ts = st.number_input(
+                "weight_ts", min_value=0.0, max_value=1000.0, value=float(TRACKER_PARAM_DEFAULTS["weight_ts"]), step=1.0
+            )
+            weight_ping_gap = st.number_input(
+                "weight_ping_gap",
+                min_value=0.0,
+                max_value=1000.0,
+                value=float(TRACKER_PARAM_DEFAULTS["weight_ping_gap"]),
+                step=1.0,
+            )
+            delta_ts_max_db = st.number_input(
+                "delta_ts_max_db",
+                min_value=0.1,
+                max_value=200.0,
+                value=float(TRACKER_PARAM_DEFAULTS["delta_ts_max_db"]),
+                step=1.0,
+                help="TS difference (dB) that normalizes the assignment cost's TS term.",
+            )
+
+        st.markdown("── Equivalent Length (optional) ──")
+        enable_equivalent_length = st.checkbox(
+            "I have a TS-length regression for this species",
+            value=False,
+            help=(
+                "Adds an equivalent_length_cm column to the track summary by inverting "
+                "TS = a*log10(length_cm) + b. The a/b coefficients are species-specific "
+                "published/measured constants -- do not guess these."
+            ),
+        )
+        ts_length_a = st.number_input(
+            "Regression coefficient a",
+            value=0.0,
+            step=0.1,
+            format="%.3f",
+            help="Slope 'a' in TS = a*log10(length_cm) + b, from a published/measured regression for this species. No default exists.",
+        )
+        ts_length_b = st.number_input(
+            "Regression coefficient b",
+            value=0.0,
+            step=0.1,
+            format="%.3f",
+            help="Intercept 'b' in TS = a*log10(length_cm) + b, from a published/measured regression for this species. No default exists.",
+        )
+        run_tracking = st.form_submit_button("Run Tracking", type="primary")
+
 if run_detection:
     if uploaded_file is None and data is None:
         st.error("Please upload a valid EK80 .raw file first.")
@@ -234,6 +409,8 @@ if run_detection:
             st.session_state.diagnostics = diagnostics
             st.session_state.last_params = params
             st.session_state.results_channel = st.session_state.selected_channel
+            st.session_state.tracked_df = None
+            st.session_state.track_summary_df = None
 
             if detections_df.empty:
                 st.warning(
@@ -244,6 +421,53 @@ if run_detection:
             st.exception(e)
         finally:
             progress.empty()
+
+if run_tracking:
+    if st.session_state.detections_df is None or st.session_state.detections_df.empty:
+        st.error("Run detection first -- tracking requires a non-empty set of detections.")
+    else:
+        tracker_params = {
+            "excl_dist_major_m": float(excl_dist_major_m),
+            "excl_dist_minor_m": float(excl_dist_minor_m),
+            "excl_dist_range_m": float(excl_dist_range_m),
+            "min_st_track": int(min_st_track),
+            "min_pings_track": int(min_pings_track),
+            "max_gap_track": int(max_gap_track),
+            "alpha_major": float(alpha_major),
+            "alpha_minor": float(alpha_minor),
+            "alpha_range": float(alpha_range),
+            "beta_major": float(beta_major),
+            "beta_minor": float(beta_minor),
+            "beta_range": float(beta_range),
+            "max_std_major_deg": float(max_std_major_deg),
+            "max_std_minor_deg": float(max_std_minor_deg),
+            "missed_ping_exp_major_pct": float(missed_ping_exp_major_pct),
+            "missed_ping_exp_minor_pct": float(missed_ping_exp_minor_pct),
+            "missed_ping_exp_range_pct": float(missed_ping_exp_range_pct),
+            "weight_major": float(weight_major),
+            "weight_minor": float(weight_minor),
+            "weight_range": float(weight_range),
+            "weight_ts": float(weight_ts),
+            "weight_ping_gap": float(weight_ping_gap),
+            "delta_ts_max_db": float(delta_ts_max_db),
+        }
+        try:
+            with st.spinner("Running tracking..."):
+                tracked_df = assign_tracks(st.session_state.detections_df, tracker_params)
+                ts_a = float(ts_length_a) if enable_equivalent_length else None
+                ts_b = float(ts_length_b) if enable_equivalent_length else None
+                track_summary_df = summarize_tracks(tracked_df, ts_length_a=ts_a, ts_length_b=ts_b)
+            st.session_state.tracked_df = tracked_df
+            st.session_state.track_summary_df = track_summary_df
+
+            if track_summary_df.empty:
+                st.warning(
+                    "No tracks met the acceptance criteria (min detections / min ping span). "
+                    "Try relaxing those, or the gate widths, and re-run tracking."
+                )
+        except Exception as e:
+            st.error("Unexpected error during tracking.")
+            st.exception(e)
 
 with st.sidebar:
     if data is not None and st.session_state.diagnostics is not None:
@@ -291,7 +515,7 @@ with st.sidebar:
         range_min_m, range_max_m = _get_range_bounds_m(view_data)
         st.text(f"Range extent: {range_min_m:.1f}–{range_max_m:.1f} m")
 
-tab1, tab2, tab3 = st.tabs(["Echogram", "TS Distribution", "Detection Table"])
+tab1, tab2, tab3, tab4 = st.tabs(["Echogram", "TS Distribution", "Detection Table", "Tracks"])
 
 with tab1:
     if data is None:
@@ -364,6 +588,23 @@ with tab3:
             "Download CSV",
             data=formatted_df.to_csv(index=False).encode("utf-8"),
             file_name=csv_name,
+            mime="text/csv",
+        )
+
+with tab4:
+    track_summary_df = st.session_state.track_summary_df
+    if track_summary_df is None:
+        st.info("Run tracking to view track summaries.")
+    else:
+        formatted_tracks_df = _format_detection_table(track_summary_df)
+        st.dataframe(formatted_tracks_df, use_container_width=True, hide_index=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = Path(st.session_state.loaded_filename or "file").stem
+        tracks_csv_name = f"tracks_{stem}_{ts}.csv"
+        st.download_button(
+            "Download CSV",
+            data=formatted_tracks_df.to_csv(index=False).encode("utf-8"),
+            file_name=tracks_csv_name,
             mime="text/csv",
         )
 
