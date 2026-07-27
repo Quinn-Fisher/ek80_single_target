@@ -64,7 +64,7 @@ def plot_echogram(dataset, detections_df, ch, value_var="Sv", title="Echogram"):
             reversescale=True,
             zmin=-80,
             zmax=-20,
-            colorbar={"title": colorbar_title},
+            colorbar={"title": colorbar_title, "x": 1.0, "len": 0.9},
             name=trace_name,
         )
     )
@@ -85,7 +85,18 @@ def plot_echogram(dataset, detections_df, ch, value_var="Sv", title="Echogram"):
         title=f"{title} | Detections: {n_det}",
         xaxis={"title": "Ping Time", "tickformat": "%H:%M:%S"},
         yaxis={"title": y_title, "autorange": "reversed"},
-        margin={"l": 60, "r": 30, "t": 50, "b": 50},
+        # Colorbar sits just outside the plot area (colorbar x=1.0 above); the
+        # legend is pushed further right so it doesn't overlap the colorbar,
+        # with a translucent background so it stays readable against the
+        # heatmap. The extra right margin makes room for both.
+        legend={
+            "x": 1.12,
+            "xanchor": "left",
+            "y": 1.0,
+            "yanchor": "top",
+            "bgcolor": "rgba(0,0,0,0.4)",
+        },
+        margin={"l": 60, "r": 160, "t": 50, "b": 50},
     )
     return fig
 
